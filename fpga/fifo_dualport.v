@@ -2,14 +2,14 @@
 
 module fifo_dualport#(
 	parameter DATA_LEN = 32,
-	parameter DEPTH = 1024,
+	parameter DEPTH = 8192,
 	parameter ADDR_LEN = $clog2(DEPTH),
 	parameter USE_UNDERFLOW = 1
 )(
 	input 						clk_wr,
 	input							clk_rd,
-	input 						rst_a,
-	input 						rst_n,			
+	input 						rst_wr_n,
+	input 						rst_rd_n,			
 	input 						wen_i, // write enable from packer8to32	
 	input 						ren_i,  // read enable from FT601
 	input [DATA_LEN-1:0] 	sram_data_r,
@@ -46,8 +46,8 @@ module fifo_dualport#(
 	//-------------------------------------------------------------
 	// Write domain pointers (gray pointers and address)
 	//-------------------------------------------------------------
-	always @(posedge clk_wr or posedge rst_a) begin
-		if (rst_a) begin
+	always @(posedge clk_wr) begin
+		if (!rst_wr_n) begin
 			wr_ptr_bin <= 0;
 			wr_ptr_gray <= 0;
 			full_ff <= 0;
@@ -73,8 +73,8 @@ module fifo_dualport#(
 	//-------------------------------------------------------------
 	// Read domain pointers (gray pointers and address)
 	//-------------------------------------------------------------
-	always @(posedge clk_rd or negedge rst_n) begin
-		if (!rst_n) begin
+	always @(posedge clk_rd) begin
+		if (!rst_rd_n) begin
 			rd_ptr_bin <= 0;
 			rd_ptr_gray <= 0;
 			empty_ff <= 1;
@@ -97,8 +97,8 @@ module fifo_dualport#(
 	//-------------------------------------------------------------
 	// Syncronization gray pointers
 	//-------------------------------------------------------------
-	always @(posedge clk_wr or posedge rst_a) begin
-		if (rst_a) begin
+	always @(posedge clk_wr) begin
+		if (!rst_wr_n) begin
 			rd_ptr_gray_sync1 <= 0;
 			rd_ptr_gray_sync2 <= 0;
 		end
@@ -108,8 +108,8 @@ module fifo_dualport#(
 		end
 	end
 	
-	always @(posedge clk_rd or negedge rst_n) begin
-		if (!rst_n) begin
+	always @(posedge clk_rd) begin
+		if (!rst_rd_n) begin
 			wr_ptr_gray_sync1 <= 0;
 			wr_ptr_gray_sync2 <= 0;
 		end
@@ -141,8 +141,8 @@ module fifo_dualport#(
 		if (USE_UNDERFLOW) begin : gen_underflow
 			reg underflow_ff;
 			
-			always @(posedge clk_rd or negedge rst_n) begin
-				if (!rst_n)
+			always @(posedge clk_rd) begin
+				if (!rst_rd_n)
 					underflow_ff <= 1'b0;
 				else if (ren_i && empty_ff)
 					underflow_ff <= 1'b1;

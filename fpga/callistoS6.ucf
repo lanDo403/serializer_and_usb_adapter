@@ -1,82 +1,99 @@
-###################################################################################################################################################
-#                                                   FT601 Signals                                                                                 #
-################################################################################################################################################### 
 #=======================================
-# FIFO INTF 
+# FPGA RESET
 #=======================================
-NET "DATA[0]"       LOC = N22      | IOSTANDARD = LVCMOS33 | SLEW = FAST | DRIVE = 8 ;              # IO_L37P_A7_M1A0_1                 Sch = FT_D0
-NET "DATA[1]"       LOC = L23      | IOSTANDARD = LVCMOS33 | SLEW = FAST | DRIVE = 8 ;              # IO_L29P_A23_M1A13_1               Sch = FT_D1
-NET "DATA[2]"       LOC = M23      | IOSTANDARD = LVCMOS33 | SLEW = FAST | DRIVE = 8 ;              # IO_L31P_A19_M1CKE_1               Sch = FT_D2
-NET "DATA[3]"       LOC = N23      | IOSTANDARD = LVCMOS33 | SLEW = FAST | DRIVE = 8 ;              # IO_L37N_A6_M1A1_1                 Sch = FT_D3
-NET "DATA[4]"       LOC = Y24      | IOSTANDARD = LVCMOS33 | SLEW = FAST | DRIVE = 8 ;              # IO_L47P_FWE_B_M1DQ0_1             Sch = FT_D4
-NET "DATA[5]"       LOC = AA24     | IOSTANDARD = LVCMOS33 | SLEW = FAST | DRIVE = 8 ;              # IO_L63N_1                         Sch = FT_D5
-NET "DATA[6]"       LOC = AA25     | IOSTANDARD = LVCMOS33 | SLEW = FAST | DRIVE = 8 ;              # IO_L51P_M1DQ12_1                  Sch = FT_D6
-NET "DATA[7]"       LOC = AB24     | IOSTANDARD = LVCMOS33 | SLEW = FAST | DRIVE = 8 ;              # IO_L49P_M1DQ10_1                  Sch = FT_D7
-NET "DATA[8]"       LOC = AC25     | IOSTANDARD = LVCMOS33 | SLEW = FAST | DRIVE = 8 ;              # IO_L50P_M1UDQS_1                  Sch = FT_D8
-NET "DATA[9]"       LOC = AC24     | IOSTANDARD = LVCMOS33 | SLEW = FAST | DRIVE = 8 ;              # IO_L65N_1                         Sch = FT_D9
-NET "DATA[10]"      LOC = AE26     | IOSTANDARD = LVCMOS33 | SLEW = FAST | DRIVE = 8 ;              # IO_L52N_M1DQ15_1                  Sch = FT_D10
-NET "DATA[11]"      LOC = AE25     | IOSTANDARD = LVCMOS33 | SLEW = FAST | DRIVE = 8 ;              # IO_L52P_M1DQ14_1                  Sch = FT_D11
-NET "DATA[12]"      LOC = AF25     | IOSTANDARD = LVCMOS33 | SLEW = FAST | DRIVE = 8 ;              # IO_L67N_1                         Sch = FT_D12
-NET "DATA[13]"      LOC = AD24     | IOSTANDARD = LVCMOS33 | SLEW = FAST | DRIVE = 8 ;              # IO_L48P_HDC_M1DQ8_1               Sch = FT_D13
-NET "DATA[14]"      LOC = AE24     | IOSTANDARD = LVCMOS33 | SLEW = FAST | DRIVE = 8 ;              # IO_L67P_1                         Sch = FT_D14
-NET "DATA[15]"      LOC = AC23     | IOSTANDARD = LVCMOS33 | SLEW = FAST | DRIVE = 8 ;              # IO_L65P_1                         Sch = FT_D15
-NET "DATA[16]"      LOC = L17      | IOSTANDARD = LVCMOS33 | SLEW = FAST | DRIVE = 8 ;              # IO_L32P_A17_M1A8_1                Sch = FT_D16
-NET "DATA[17]"      LOC = K18      | IOSTANDARD = LVCMOS33 | SLEW = FAST | DRIVE = 8 ;              # IO_L32N_A16_M1A9_1                Sch = FT_D17
-NET "DATA[18]"      LOC = L18      | IOSTANDARD = LVCMOS33 | SLEW = FAST | DRIVE = 8 ;              # IO_L34N_A12_M1BA2_1               Sch = FT_D18
-NET "DATA[19]"      LOC = K19      | IOSTANDARD = LVCMOS33 | SLEW = FAST | DRIVE = 8 ;              # IO_L28N_VREF_1                    Sch = FT_D19
-NET "DATA[20]"      LOC = L19      | IOSTANDARD = LVCMOS33 | SLEW = FAST | DRIVE = 8 ;              # IO_L28P_1                         Sch = FT_D20
-NET "DATA[21]"      LOC = M21      | IOSTANDARD = LVCMOS33 | SLEW = FAST | DRIVE = 8 ;              # IO_L40N_GCLK10_M1A6_1             Sch = FT_D21
-NET "DATA[22]"      LOC = M19      | IOSTANDARD = LVCMOS33 | SLEW = FAST | DRIVE = 8 ;              # IO_L34P_A13_M1WE_1                Sch = FT_D22
-NET "DATA[23]"      LOC = N24      | IOSTANDARD = LVCMOS33 | SLEW = FAST | DRIVE = 8 ;              # IO_L31N_A18_M1A12_1               Sch = FT_D23
-NET "DATA[24]"      LOC = P24      | IOSTANDARD = LVCMOS33 | SLEW = FAST | DRIVE = 8 ;              # IO_L33P_A15_M1A10_1               Sch = FT_D24
-NET "DATA[25]"      LOC = N21      | IOSTANDARD = LVCMOS33 | SLEW = FAST | DRIVE = 8 ;              # IO_L30N_A20_M1A11_1               Sch = FT_D25
-NET "DATA[26]"      LOC = N20      | IOSTANDARD = LVCMOS33 | SLEW = FAST | DRIVE = 8 ;              # IO_L40P_GCLK11_M1A5_1             Sch = FT_D26
-NET "DATA[27]"      LOC = N19      | IOSTANDARD = LVCMOS33 | SLEW = FAST | DRIVE = 8 ;              # IO_L36N_A8_M1BA1_1                Sch = FT_D27
-NET "DATA[28]"      LOC = P18      | IOSTANDARD = LVCMOS33 | SLEW = FAST | DRIVE = 8 ;              # IO_L56N_1                         Sch = FT_D28
-NET "DATA[29]"      LOC = P17      | IOSTANDARD = LVCMOS33 | SLEW = FAST | DRIVE = 8 ;              # IO_L56P_1                         Sch = FT_D29
-NET "DATA[30]"      LOC = R18      | IOSTANDARD = LVCMOS33 | SLEW = FAST | DRIVE = 8 ;              # IO_L58N_1                         Sch = FT_D30
-NET "DATA[31]"      LOC = R17      | IOSTANDARD = LVCMOS33 | SLEW = FAST | DRIVE = 8 ;              # IO_L58P_1                         Sch = FT_D31
-NET "BE[0]"         LOC = P26      | IOSTANDARD = LVCMOS33 | SLEW = FAST | DRIVE = 8 ;              # IO_L33N_A14_M1A4_1                Sch = FT_BE0
-NET "BE[1]"         LOC = R26      | IOSTANDARD = LVCMOS33 | SLEW = FAST | DRIVE = 8 ;              # IO_L35N_A10_M1A2_1                Sch = FT_BE1
-NET "BE[2]"         LOC = T26      | IOSTANDARD = LVCMOS33 | SLEW = FAST | DRIVE = 8 ;              # IO_L46N_FOE_B_M1DQ3_1             Sch = FT_BE2
-NET "BE[3]"         LOC = U26      | IOSTANDARD = LVCMOS33 | SLEW = FAST | DRIVE = 8 ;              # IO_L43N_GCLK4_M1DQ5_1             Sch = FT_BE3
-NET "RXF_N"         LOC = W26      | IOSTANDARD = LVCMOS33 | SLEW = FAST | DRIVE = 8 ;              # IO_L44N_A2_M1DQ7_1                Sch = FT_RXE
-NET "TXE_N"         LOC = V26      | IOSTANDARD = LVCMOS33 | SLEW = FAST | DRIVE = 8 ;              # IO_L45N_A0_M1LDQSN_1              Sch = FT_TXE
-NET "RD_N"          LOC = AA26     | IOSTANDARD = LVCMOS33 | SLEW = FAST | DRIVE = 8 ;              # IO_L51N_M1DQ13_1                  Sch = FT_RD
-NET "WR_N"          LOC = Y26      | IOSTANDARD = LVCMOS33 | SLEW = FAST | DRIVE = 8 ;              # IO_L47N_LDC_M1DQ1_1               Sch = FT_WR
-NET "WAKEUP_N"        LOC = AD26     | IOSTANDARD = LVCMOS33 | SLEW = FAST | DRIVE = 8 ;              # IO_L48N_M1DQ9_1                   Sch = FT_WK
-NET "OE_N"          LOC = AB26     | IOSTANDARD = LVCMOS33 | SLEW = FAST | DRIVE = 8 ;              # IO_L49N_M1DQ11_1                  Sch = FT_OE
-NET "CLK"        LOC = U25      | IOSTANDARD = LVCMOS33 ;                                        # IO_L43P_GCLK5_M1DQ4_1             Sch = FT_CLK
-NET "RESET_N"        LOC = AC26     | IOSTANDARD = LVCMOS33 ;                                        # IO_L50N_M1UDQSN_1                 Sch = FT_RST
+NET "FPGA_RESET" LOC = A23 | IOSTANDARD = "LVCMOS33";              								# IO_L1N_A24_VREF_5          Sch = C37
 #=======================================
-# CLOCK 
+# GPIO DATA 
 #=======================================
-NET "CLK" TNM_NET = "CLK"; 
-TIMESPEC "TS_CLK" = PERIOD "CLK" 10 ns HIGH 50.00% INPUT_JITTER 800 ps PRIORITY 1; 
+NET "GPIO_CLK" LOC = C13 | IOSTANDARD = "LVCMOS33";					 								 # IO_L34P_GCLK19_0          Sch = B13
+NET "GPIO_DATA[0]" LOC = A12 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;             # IO_L26N_0                Sch = B14
+NET "GPIO_DATA[1]" LOC = A11 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;             # IO_L24N_0                Sch = B15
+NET "GPIO_DATA[2]" LOC = D11 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;             # IO_L23P_0                Sch = B16
+NET "GPIO_DATA[3]" LOC = B10 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;             # IO_L22P_0                Sch = B17
+NET "GPIO_DATA[4]" LOC = A9 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;             # IO_L17N_0                Sch = B18
+NET "GPIO_DATA[5]" LOC = B8 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;             # IO_L16P_0                Sch = B19
+NET "GPIO_DATA[6]" LOC = C7 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;             # IO_L12P_0                Sch = B20
+NET "GPIO_DATA[7]" LOC = D7 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;             # IO_L13N_0                Sch = B21
+NET "GPIO_STROB" LOC = A6 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;               # IO_L6N_0                 Sch = B22
 #=======================================
-# SYSTEM INTF 
+# FT INTF 
 #=======================================
-NET "MLTCN"         LOC = "D14";
+NET "DATA[0]" LOC = N22 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;               # IO_L37P_A7_M1A0_1                 Sch = FT_D0
+NET "DATA[1]" LOC = L23 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;               # IO_L29P_A23_M1A13_1               Sch = FT_D1
+NET "DATA[2]" LOC = M23 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;               # IO_L31P_A19_M1CKE_1               Sch = FT_D2
+NET "DATA[3]" LOC = N23 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;               # IO_L37N_A6_M1A1_1                 Sch = FT_D3
+NET "DATA[4]" LOC = Y24 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;               # IO_L47P_FWE_B_M1DQ0_1             Sch = FT_D4
+NET "DATA[5]" LOC = AA24 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;              # IO_L63N_1                         Sch = FT_D5
+NET "DATA[6]" LOC = AA25 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;              # IO_L51P_M1DQ12_1                  Sch = FT_D6
+NET "DATA[7]" LOC = AB24 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;              # IO_L49P_M1DQ10_1                  Sch = FT_D7
+NET "DATA[8]" LOC = AC25 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;              # IO_L50P_M1UDQS_1                  Sch = FT_D8
+NET "DATA[9]" LOC = AC24 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;              # IO_L65N_1                         Sch = FT_D9
+NET "DATA[10]" LOC = AE26 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;             # IO_L52N_M1DQ15_1                  Sch = FT_D10
+NET "DATA[11]" LOC = AE25 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;             # IO_L52P_M1DQ14_1                  Sch = FT_D11
+NET "DATA[12]" LOC = AF25 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;             # IO_L67N_1                         Sch = FT_D12
+NET "DATA[13]" LOC = AD24 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;             # IO_L48P_HDC_M1DQ8_1               Sch = FT_D13
+NET "DATA[14]" LOC = AE24 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;             # IO_L67P_1                         Sch = FT_D14
+NET "DATA[15]" LOC = AC23 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;             # IO_L65P_1                         Sch = FT_D15
+NET "DATA[16]" LOC = L17 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;              # IO_L32P_A17_M1A8_1                Sch = FT_D16
+NET "DATA[17]" LOC = K18 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;              # IO_L32N_A16_M1A9_1                Sch = FT_D17
+NET "DATA[18]" LOC = L18 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;              # IO_L34N_A12_M1BA2_1               Sch = FT_D18
+NET "DATA[19]" LOC = K19 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;              # IO_L28N_VREF_1                    Sch = FT_D19
+NET "DATA[20]" LOC = L19 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;              # IO_L28P_1                         Sch = FT_D20
+NET "DATA[21]" LOC = M21 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;              # IO_L40N_GCLK10_M1A6_1             Sch = FT_D21
+NET "DATA[22]" LOC = M19 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;              # IO_L34P_A13_M1WE_1                Sch = FT_D22
+NET "DATA[23]" LOC = N24 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;              # IO_L31N_A18_M1A12_1               Sch = FT_D23
+NET "DATA[24]" LOC = P24 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;              # IO_L33P_A15_M1A10_1               Sch = FT_D24
+NET "DATA[25]" LOC = N21 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;              # IO_L30N_A20_M1A11_1               Sch = FT_D25
+NET "DATA[26]" LOC = N20 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;              # IO_L40P_GCLK11_M1A5_1             Sch = FT_D26
+NET "DATA[27]" LOC = N19 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;              # IO_L36N_A8_M1BA1_1                Sch = FT_D27
+NET "DATA[28]" LOC = P18 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;              # IO_L56N_1                         Sch = FT_D28
+NET "DATA[29]" LOC = P17 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;              # IO_L56P_1                         Sch = FT_D29
+NET "DATA[30]" LOC = R18 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;              # IO_L58N_1                         Sch = FT_D30
+NET "DATA[31]" LOC = R17 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;              # IO_L58P_1                         Sch = FT_D31
+#
+NET "BE[0]" LOC = P26 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;              # IO_L33N_A14_M1A4_1                Sch = FT_BE0
+NET "BE[1]" LOC = R26 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;              # IO_L35N_A10_M1A2_1                Sch = FT_BE1
+NET "BE[2]" LOC = T26 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;              # IO_L46N_FOE_B_M1DQ3_1             Sch = FT_BE2
+NET "BE[3]" LOC = U26 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;              # IO_L43N_GCLK4_M1DQ5_1             Sch = FT_BE3
+#
+NET "RXF_N" LOC = W26 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;              # IO_L44N_A2_M1DQ7_1                Sch = FT_RXE
+NET "TXE_N" LOC = V26 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;              # IO_L45N_A0_M1LDQSN_1              Sch = FT_TXE
+NET "RD_N" LOC = AA26 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;              # IO_L51N_M1DQ13_1                  Sch = FT_RD
+NET "WR_N" LOC = Y26 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;              # IO_L47N_LDC_M1DQ1_1               Sch = FT_WR
+NET "OE_N" LOC = AB26 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;              # IO_L49N_M1DQ11_1                  Sch = FT_OE
+NET "CLK" LOC = U25 | IOSTANDARD = "LVCMOS33";                                        # IO_L43P_GCLK5_M1DQ4_1             Sch = FT_CLK
+NET "RESET_N" LOC = AC26 | IOSTANDARD = "LVCMOS33";                                        # IO_L50N_M1UDQSN_1                 Sch = FT_RST
+# NET "WAKEUP_N" LOC = AD26 | IOSTANDARD = "LVCMOS33" | SLEW = FAST | DRIVE = 8;              # IO_L48N_M1DQ9_1                   Sch = FT_WK
+#=======================================
+# FT CLOCK and GPIO CLOCK
+#=======================================
+NET "GPIO_CLK" TNM_NET = "CLK_GPIO";
+NET "CLK" TNM_NET = "CLK_FT"; 
+
+TIMESPEC "TS_CLK" = PERIOD "CLK_FT" 15 ns HIGH 50.00% INPUT_JITTER 800 ps PRIORITY 1; # 66.67 MHz or 100 MHz = 10 ns
+TIMESPEC "TS_GPIO" = PERIOD "CLK_GPIO" 20 ns HIGH 50%; # 50 MHz maximum
 #=======================================
 # IO constraints 
 #=======================================
 NET "DATA<*>"        TNM = "M_FIFO_IO";
 NET "BE<*>"          TNM = "M_FIFO_IO";
 NET "RXF_N"          TNM = "M_FIFO_I";
-NET "TXE_N"          TNM = "M_FIFO_I1";
+NET "TXE_N"          TNM = "M_FIFO_I";
 NET "WR_N"           TNM = "M_FIFO_O";
 NET "RD_N"           TNM = "M_FIFO_O";
 NET "OE_N"           TNM = "M_FIFO_O";
-#
-INST "i1_fsm/odata*"  IOB=TRUE;
-INST "i1_fsm/obe*"    IOB=TRUE;
-INST "i1_fsm/wr_n"    IOB=TRUE;
-INST "i1_fsm/rd_n"    IOB=TRUE;
-INST "i1_fsm/oe_n"    IOB=TRUE;
-INST "i1_fsm/irxf_n*" IOB=TRUE;
 
-TIMEGRP "M_FIFO_IO" OFFSET = IN  6 ns VALID 6.5 ns BEFORE "CLK" RISING;
-TIMEGRP "M_FIFO_I"  OFFSET = IN  6 ns VALID 6.5 ns BEFORE "CLK" RISING;
+# INST "gpio/data_rx*"  IOB = TRUE;
+# INST "gpio/strob_rx"  IOB = TRUE;
+# 
+# INST "fsm/tx_data_ff*" IOB = TRUE;
+# INST "fsm/be_o_ff*"    IOB = TRUE;
+# INST "fsm/wr_ff"       IOB = TRUE;
+# INST "fsm/rd_ff"       IOB = TRUE;
+# INST "fsm/oe_ff"       IOB = TRUE;
 
-TIMEGRP "M_FIFO_IO" OFFSET = OUT 9 ns VALID 5.8 ns AFTER "CLK" RISING;
-TIMEGRP "M_FIFO_O"  OFFSET = OUT 9 ns VALID 5.8 ns AFTER "CLK" RISING;
+TIMEGRP "M_FIFO_IO" OFFSET = IN 4 ns VALID 6.5 ns BEFORE "CLK" RISING;
+TIMEGRP "M_FIFO_I"  OFFSET = IN 4 ns VALID 6.5 ns BEFORE "CLK" RISING;
+
+TIMEGRP "M_FIFO_IO" OFFSET = OUT 14 ns VALID 9.2 ns AFTER "CLK" RISING;
+TIMEGRP "M_FIFO_O" OFFSET = OUT 14 ns VALID 9.2 ns AFTER "CLK" RISING;

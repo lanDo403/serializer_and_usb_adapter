@@ -32,10 +32,10 @@ module fifo_rx_ctrl #(
 	assign fifo_rx_pop_o = ~fifo_rx_empty_i;
 	assign tx_fifo_error_o = tx_fifo_error_ff;
 	assign rx_fifo_error_o = rx_fifo_error_ff;
-	// Toggle is synchronized into lvds_clk domain and converted there to a clear pulse.
+	// Toggle is synchronized into gpio_clk domain and converted there to a clear pulse.
 	assign clr_tx_error_tgl_o = clr_tx_error_tgl_ff;
 
-	always @(posedge clk or negedge rst_n) begin
+	always @(posedge clk) begin
 		if (!rst_n) begin
 			fifo_rx_ren_d <= 1'b0;
 			tx_fifo_error_ff <= 1'b0;
