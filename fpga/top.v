@@ -20,7 +20,7 @@ module top #(
 	parameter FIFO_DEPTH = 8192,
 	parameter ADDR_LEN = $clog2(FIFO_DEPTH),
 	parameter FIFO_RX_LEN = DATA_LEN + BE_LEN,
-	parameter FT_LOOPBACK_TEST = 1'b0
+	parameter FT_LOOPBACK_TEST = 1'b1
 )(
 	// GPIO signals from FPGA logic
 	input   						GPIO_CLK,

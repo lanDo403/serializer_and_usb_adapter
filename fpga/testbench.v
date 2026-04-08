@@ -38,8 +38,6 @@ endmodule
 
 module testbench;
 
-   parameter FT_LOOPBACK_TEST = 1'b0;
-
    localparam integer TOTAL_WORDS = 3402;
    localparam integer PAUSE_LEN   = 16;
 
@@ -73,8 +71,18 @@ module testbench;
 
    integer exp_words_n;
    integer tx_words_n;
+   integer rx_words_n;
    integer rx_active_cycles_n;
    integer oe_active_cycles_n;
+   reg     rx_burst_seen;
+   reg     tx_burst_seen;
+   reg     prev_ft_oe_n;
+   reg     prev_ft_rd_n;
+   reg     prev_ft_txe_n;
+   reg     prev_ft_rxf_n;
+   reg     rx_expect_rd_after_oe;
+   reg     rx_expect_release_after_rxf;
+   reg     tx_expect_release_after_txe;
 
    assign ft_data_bus = host_drive_en ? host_data_drv : {DATA_LEN{1'bz}};
    assign ft_be_bus   = host_drive_en ? host_be_drv   : {BE_LEN{1'bz}};
@@ -82,13 +90,22 @@ module testbench;
    always #10  gpio_clk = ~gpio_clk;   // 50 MHz GPIO clock
    always #7.5 ft_clk   = ~ft_clk;     // 66.67 MHz FT601 clock
 
+`ifdef TB_FORCE_FT_LOOPBACK_TEST
    top #(
       .GPIO_LEN(GPIO_LEN),
       .DATA_LEN(DATA_LEN),
       .BE_LEN(BE_LEN),
       .FIFO_DEPTH(FIFO_DEPTH),
-      .FT_LOOPBACK_TEST(FT_LOOPBACK_TEST)
+      .FT_LOOPBACK_TEST(`TB_FORCE_FT_LOOPBACK_TEST)
    ) dut (
+`else
+   top #(
+      .GPIO_LEN(GPIO_LEN),
+      .DATA_LEN(DATA_LEN),
+      .BE_LEN(BE_LEN),
+      .FIFO_DEPTH(FIFO_DEPTH)
+   ) dut (
+`endif
       .GPIO_CLK(gpio_clk),
       .GPIO_DATA(gpio_data),
       .GPIO_STROB(gpio_strob),
@@ -118,8 +135,18 @@ module testbench;
       host_be_drv   = {BE_LEN{1'b0}};
       exp_words_n   = 0;
       tx_words_n    = 0;
+      rx_words_n    = 0;
       rx_active_cycles_n = 0;
       oe_active_cycles_n = 0;
+      rx_burst_seen = 1'b0;
+      tx_burst_seen = 1'b0;
+      prev_ft_oe_n  = 1'b1;
+      prev_ft_rd_n  = 1'b1;
+      prev_ft_txe_n = 1'b1;
+      prev_ft_rxf_n = 1'b1;
+      rx_expect_rd_after_oe      = 1'b0;
+      rx_expect_release_after_rxf = 1'b0;
+      tx_expect_release_after_txe = 1'b0;
    end
 
    task fail(input [1023:0] msg);
@@ -339,6 +366,26 @@ module testbench;
       end
    endtask
 
+   task ft_set_txe_now(input val);
+      begin
+         ft_txe_n <= val;
+      end
+   endtask
+
+   task ft_drive_rx_now(
+      input [DATA_LEN-1:0] data_i,
+      input [BE_LEN-1:0]   be_i,
+      input                drive_en_i,
+      input                rxf_n_i
+   );
+      begin
+         host_drive_en <= drive_en_i;
+         host_be_drv   <= be_i;
+         host_data_drv <= data_i;
+         ft_rxf_n      <= rxf_n_i;
+      end
+   endtask
+
    task wait_gpio_cycles(input integer cycles);
       integer i;
       begin
@@ -366,6 +413,25 @@ module testbench;
       end
    endtask
 
+   task expect_rx_word(
+      input integer        wi,
+      input [DATA_LEN-1:0] got_data,
+      input [BE_LEN-1:0]   got_be
+   );
+      begin
+         if (wi >= exp_words_n)
+            fail("unexpected FT601 RX word");
+         if (got_data !== exp_words[wi]) begin
+            $display("ERROR: RX word [%0d] got=%h expected=%h", wi, got_data, exp_words[wi]);
+            $finish;
+         end
+         if (got_be !== {BE_LEN{1'b1}}) begin
+            $display("ERROR: RX BE [%0d] got=%h expected=%h", wi, got_be, {BE_LEN{1'b1}});
+            $finish;
+         end
+      end
+   endtask
+
    task wait_for_tx_words(
       input integer expected_words,
       input integer timeout_cycles
@@ -386,6 +452,26 @@ module testbench;
       end
    endtask
 
+   task wait_for_rx_words(
+      input integer expected_words,
+      input integer timeout_cycles
+   );
+      integer i;
+      begin
+         for (i = 0; i < timeout_cycles; i = i + 1) begin
+            if (rx_words_n == expected_words)
+               i = timeout_cycles;
+            else
+               @(negedge ft_clk);
+         end
+
+         if (rx_words_n !== expected_words) begin
+            $display("ERROR: RX timeout, got=%0d expected=%0d", rx_words_n, expected_words);
+            $finish;
+         end
+      end
+   endtask
+
    task expect_no_tx_for_cycles(input integer cycles);
       integer start_words;
       begin
@@ -396,15 +482,37 @@ module testbench;
       end
    endtask
 
+   task inject_txe_backpressure(
+      input integer after_words,
+      input integer stall_cycles
+   );
+      integer i;
+      begin
+         while (tx_words_n < after_words)
+            @(negedge ft_clk);
+
+         @(posedge ft_clk);
+         ft_set_txe_now(1'b1);
+         $display("INFO: TXE_N deasserted high to emulate FT601 backpressure");
+
+         for (i = 0; i < stall_cycles; i = i + 1)
+            @(negedge ft_clk);
+
+         @(posedge ft_clk);
+         ft_set_txe_now(1'b0);
+         $display("INFO: TXE_N asserted low again, FT601 accepts TX data");
+      end
+   endtask
+
    task drive_ft_loopback_stream;
       integer i;
       integer timeout;
       begin
-         @(negedge ft_clk);
-         host_drive_en = 1'b1;
-         host_be_drv   = {BE_LEN{1'b1}};
-         host_data_drv = exp_words[0];
-         ft_rxf_n      = 1'b0;
+         if (exp_words_n <= 0)
+            fail("loopback stimulus is empty");
+
+         @(posedge ft_clk);
+         ft_drive_rx_now(exp_words[0], {BE_LEN{1'b1}}, 1'b1, 1'b0);
 
          timeout = 0;
          while ((ft_rd_n !== 1'b0) || (ft_oe_n !== 1'b0)) begin
@@ -414,26 +522,29 @@ module testbench;
                fail("FT601 RX burst did not start");
          end
 
-         for (i = 0; i < exp_words_n; i = i + 1) begin
-            @(negedge ft_clk);
+         if (exp_words_n == 1)
+            ft_drive_rx_now(exp_words[0], {BE_LEN{1'b1}}, 1'b1, 1'b1);
+         else
+            ft_drive_rx_now(exp_words[1], {BE_LEN{1'b1}}, 1'b1, 1'b0);
+
+         for (i = 1; i + 1 < exp_words_n; i = i + 1) begin
+            @(posedge ft_clk);
             if ((ft_rd_n !== 1'b0) || (ft_oe_n !== 1'b0))
                fail("RX burst has an unexpected gap");
-            if (i + 1 < exp_words_n)
-               host_data_drv = exp_words[i + 1];
+            if (i + 2 == exp_words_n)
+               ft_drive_rx_now(exp_words[i + 1], {BE_LEN{1'b1}}, 1'b1, 1'b1);
             else
-               ft_rxf_n = 1'b1;
+               ft_drive_rx_now(exp_words[i + 1], {BE_LEN{1'b1}}, 1'b1, 1'b0);
          end
 
-         @(negedge ft_clk);
-         host_drive_en = 1'b0;
-         host_data_drv = {DATA_LEN{1'b0}};
-         host_be_drv   = {BE_LEN{1'b0}};
+         @(posedge ft_clk);
+         ft_drive_rx_now({DATA_LEN{1'b0}}, {BE_LEN{1'b0}}, 1'b0, 1'b1);
       end
    endtask
 
    task test_gpio_mode;
       begin
-         if (FT_LOOPBACK_TEST !== 1'b0)
+         if (dut.FT_LOOPBACK_TEST !== 1'b0)
             fail("GPIO-mode test started while FT_LOOPBACK_TEST is not 0");
          $display("INFO: Starting GPIO to FT601 mode test");
 
@@ -444,11 +555,14 @@ module testbench;
          expect_no_tx_for_cycles(8);
          $display("INFO: Confirmed TX path stays idle while TXE_N is inactive");
 
-         @(negedge ft_clk);
-         ft_txe_n = 1'b0;
+         @(posedge ft_clk);
+         ft_set_txe_now(1'b0);
          $display("INFO: TXE_N asserted low, waiting for FT601 transmission");
 
-         wait_for_tx_words(exp_words_n, 12000);
+         fork
+            wait_for_tx_words(exp_words_n, 12000);
+            inject_txe_backpressure(8, 2);
+         join
 
          if (rx_active_cycles_n != 0)
             fail("RD_N became active in GPIO TX-only mode");
@@ -462,22 +576,37 @@ module testbench;
 
    task test_loopback_mode;
       begin
-         if (FT_LOOPBACK_TEST !== 1'b1)
+         if (dut.FT_LOOPBACK_TEST !== 1'b1)
             fail("Loopback-mode test started while FT_LOOPBACK_TEST is not 1");
          $display("INFO: Starting FT601 loopback mode test");
 
-         @(negedge ft_clk);
-         ft_txe_n = 1'b0;
-         $display("INFO: TXE_N asserted low, FT601 may accept loopback data");
+         ft_txe_n = 1'b1;
+         $display("INFO: TXE_N held high during FT601 receive phase");
 
          drive_ft_loopback_stream();
-         $display("INFO: FT601 RX stimulus burst driven into DUT");
-         wait_for_tx_words(exp_words_n, 16000);
+         $display("INFO: FT601 RX stimulus burst driven into DUT from data_p words");
+         wait_for_rx_words(exp_words_n, 16000);
+         $display("INFO: DUT accepted %0d words from FT601", rx_words_n);
+
+         expect_no_tx_for_cycles(8);
+         $display("INFO: Confirmed TX path stays idle while TXE_N is inactive");
+
+         @(posedge ft_clk);
+         ft_set_txe_now(1'b0);
+         $display("INFO: TXE_N asserted low, FT601 may accept loopback data");
+
+         fork
+            wait_for_tx_words(exp_words_n, 16000);
+            inject_txe_backpressure(8, 2);
+         join
+         $display("INFO: DUT returned %0d words back to FT601", tx_words_n);
 
          if (rx_active_cycles_n == 0)
             fail("RD_N never became active in loopback mode");
          if (oe_active_cycles_n == 0)
             fail("OE_N never became active in loopback mode");
+         if (rx_words_n !== exp_words_n)
+            fail("RX word count does not match expected loopback payload");
          if (dut.empty_fifo_rx !== 1'b1)
             fail("RX FIFO is not empty after loopback transmission");
          $display("INFO: Loopback mode test passed, looped back %0d words", tx_words_n);
@@ -488,13 +617,75 @@ module testbench;
    always @(negedge ft_clk or negedge ft_reset_n) begin
       if (!ft_reset_n) begin
          tx_words_n <= 0;
+         rx_words_n <= 0;
          rx_active_cycles_n <= 0;
          oe_active_cycles_n <= 0;
+         rx_burst_seen <= 1'b0;
+         tx_burst_seen <= 1'b0;
+         prev_ft_oe_n  <= 1'b1;
+         prev_ft_rd_n  <= 1'b1;
+         prev_ft_txe_n <= 1'b1;
+         prev_ft_rxf_n <= 1'b1;
+         rx_expect_rd_after_oe       <= 1'b0;
+         rx_expect_release_after_rxf <= 1'b0;
+         tx_expect_release_after_txe <= 1'b0;
       end
       else begin
+         if (rx_expect_rd_after_oe) begin
+            if (ft_rd_n !== 1'b0)
+               fail("RD_N must assert one FT clock after OE_N");
+            rx_expect_rd_after_oe <= 1'b0;
+         end
+
+         if (rx_expect_release_after_rxf) begin
+            if ((ft_oe_n !== 1'b1) || (ft_rd_n !== 1'b1))
+               fail("OE_N and RD_N must deassert one FT clock after RXF_N goes high");
+            rx_expect_release_after_rxf <= 1'b0;
+         end
+
+         if (tx_expect_release_after_txe) begin
+            if (ft_wr_n !== 1'b1)
+               fail("WR_N must deassert one FT clock after TXE_N goes high");
+            tx_expect_release_after_txe <= 1'b0;
+         end
+
+         if (prev_ft_oe_n && !ft_oe_n) begin
+            if (ft_rd_n !== 1'b1)
+               fail("RD_N must stay inactive in the cycle OE_N first asserts");
+            rx_expect_rd_after_oe <= 1'b1;
+         end
+
+         if (prev_ft_rd_n && !ft_rd_n) begin
+            if ((prev_ft_oe_n !== 1'b0) || (ft_oe_n !== 1'b0))
+               fail("RD_N must assert only after OE_N is already active");
+         end
+
+         if (!prev_ft_rxf_n && ft_rxf_n && ((!ft_oe_n) || (!ft_rd_n)))
+            rx_expect_release_after_rxf <= 1'b1;
+
+         if (!prev_ft_txe_n && ft_txe_n && !ft_wr_n)
+            tx_expect_release_after_txe <= 1'b1;
+
+         if (dut.fifo_append) begin
+            if (!rx_burst_seen) begin
+               $display("INFO: FT601 RX burst started");
+               rx_burst_seen <= 1'b1;
+            end
+            if (rx_words_n < 2)
+               $display("INFO: RX sample[%0d] data=%h be=%h", rx_words_n, dut.fsm_data_o, dut.fsm_be_o);
+            expect_rx_word(rx_words_n, dut.fsm_data_o, dut.fsm_be_o);
+            rx_words_n <= rx_words_n + 1;
+         end
+
          if (!ft_wr_n) begin
             if (host_drive_en)
                fail("DATA/BE bus contention during FT601 TX");
+            if (!tx_burst_seen) begin
+               $display("INFO: FT601 TX burst started");
+               tx_burst_seen <= 1'b1;
+            end
+            if (tx_words_n < 2)
+               $display("INFO: TX sample[%0d] data=%h be=%h", tx_words_n, ft_data_bus, ft_be_bus);
             expect_tx_word(tx_words_n, ft_data_bus, ft_be_bus);
             tx_words_n <= tx_words_n + 1;
          end
@@ -503,26 +694,27 @@ module testbench;
             rx_active_cycles_n <= rx_active_cycles_n + 1;
          if (!ft_oe_n)
             oe_active_cycles_n <= oe_active_cycles_n + 1;
+
+         prev_ft_oe_n  <= ft_oe_n;
+         prev_ft_rd_n  <= ft_rd_n;
+         prev_ft_txe_n <= ft_txe_n;
+         prev_ft_rxf_n <= ft_rxf_n;
       end
    end
 
    initial begin
-      $display("INFO: Testbench start. FT_LOOPBACK_TEST=%0d", FT_LOOPBACK_TEST);
+      $display("INFO: Testbench start. top.FT_LOOPBACK_TEST=%0d", dut.FT_LOOPBACK_TEST);
       load_vectors();
       build_expected_words();
 
-      if (dut.FT_LOOPBACK_TEST !== FT_LOOPBACK_TEST)
-         fail("top parameter FT_LOOPBACK_TEST mismatch");
-      $display("INFO: Top parameter check passed");
-
       tb_reset();
 
-      if (FT_LOOPBACK_TEST == 1'b0)
+      if (dut.FT_LOOPBACK_TEST == 1'b0)
          test_gpio_mode();
       else
          test_loopback_mode();
 
-      $display("TEST PASSED. FT_LOOPBACK_TEST=%0d words=%0d", FT_LOOPBACK_TEST, exp_words_n);
+      $display("TEST PASSED. FT_LOOPBACK_TEST=%0d words=%0d", dut.FT_LOOPBACK_TEST, exp_words_n);
       $finish;
    end
 
