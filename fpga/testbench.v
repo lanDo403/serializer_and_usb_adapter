@@ -78,11 +78,22 @@ module testbench;
    reg     tx_burst_seen;
    reg     prev_ft_oe_n;
    reg     prev_ft_rd_n;
-   reg     prev_ft_txe_n;
+   reg     prev_ft_wr_n;
+   reg     prev_ft_txe_n_neg;
+   reg     prev_ft_txe_n_pos;
    reg     prev_ft_rxf_n;
    reg     rx_expect_rd_after_oe;
    reg     rx_expect_release_after_rxf;
-   reg     tx_expect_release_after_txe;
+   reg     tx_assert_wait;
+   reg     tx_release_wait;
+   integer tx_assert_cycles_cur;
+   integer tx_release_cycles_cur;
+   integer tx_assert_cycles_last;
+   integer tx_release_cycles_last;
+   integer tx_assert_cycles_max;
+   integer tx_release_cycles_max;
+   integer tx_assert_events_n;
+   integer tx_release_events_n;
 
    assign ft_data_bus = host_drive_en ? host_data_drv : {DATA_LEN{1'bz}};
    assign ft_be_bus   = host_drive_en ? host_be_drv   : {BE_LEN{1'bz}};
@@ -142,11 +153,22 @@ module testbench;
       tx_burst_seen = 1'b0;
       prev_ft_oe_n  = 1'b1;
       prev_ft_rd_n  = 1'b1;
-      prev_ft_txe_n = 1'b1;
+      prev_ft_wr_n  = 1'b1;
+      prev_ft_txe_n_neg = 1'b1;
+      prev_ft_txe_n_pos = 1'b1;
       prev_ft_rxf_n = 1'b1;
       rx_expect_rd_after_oe      = 1'b0;
       rx_expect_release_after_rxf = 1'b0;
-      tx_expect_release_after_txe = 1'b0;
+      tx_assert_wait = 1'b0;
+      tx_release_wait = 1'b0;
+      tx_assert_cycles_cur = 0;
+      tx_release_cycles_cur = 0;
+      tx_assert_cycles_last = 0;
+      tx_release_cycles_last = 0;
+      tx_assert_cycles_max = 0;
+      tx_release_cycles_max = 0;
+      tx_assert_events_n = 0;
+      tx_release_events_n = 0;
    end
 
    task fail(input [1023:0] msg);
@@ -570,6 +592,11 @@ module testbench;
             fail("OE_N became active in GPIO TX-only mode");
          if (dut.empty_fifo !== 1'b1)
             fail("TX FIFO is not empty after GPIO-mode transmission");
+         $display("INFO: TX assert latency max=%0d FT clocks, release latency max=%0d FT clocks", tx_assert_cycles_max + 1, tx_release_cycles_max + 1);
+         if (tx_assert_events_n == 0)
+            fail("TX assert latency was never measured in GPIO mode");
+         if (tx_release_events_n == 0)
+            fail("TX release latency was never measured in GPIO mode");
          $display("INFO: GPIO mode test passed, transmitted %0d words", tx_words_n);
       end
    endtask
@@ -609,6 +636,11 @@ module testbench;
             fail("RX word count does not match expected loopback payload");
          if (dut.empty_fifo_rx !== 1'b1)
             fail("RX FIFO is not empty after loopback transmission");
+         $display("INFO: TX assert latency max=%0d FT clocks, release latency max=%0d FT clocks", tx_assert_cycles_max + 1, tx_release_cycles_max + 1);
+         if (tx_assert_events_n == 0)
+            fail("TX assert latency was never measured in loopback mode");
+         if (tx_release_events_n == 0)
+            fail("TX release latency was never measured in loopback mode");
          $display("INFO: Loopback mode test passed, looped back %0d words", tx_words_n);
       end
    endtask
@@ -624,11 +656,11 @@ module testbench;
          tx_burst_seen <= 1'b0;
          prev_ft_oe_n  <= 1'b1;
          prev_ft_rd_n  <= 1'b1;
-         prev_ft_txe_n <= 1'b1;
+         prev_ft_wr_n  <= 1'b1;
+         prev_ft_txe_n_neg <= 1'b1;
          prev_ft_rxf_n <= 1'b1;
          rx_expect_rd_after_oe       <= 1'b0;
          rx_expect_release_after_rxf <= 1'b0;
-         tx_expect_release_after_txe <= 1'b0;
       end
       else begin
          if (rx_expect_rd_after_oe) begin
@@ -641,12 +673,6 @@ module testbench;
             if ((ft_oe_n !== 1'b1) || (ft_rd_n !== 1'b1))
                fail("OE_N and RD_N must deassert one FT clock after RXF_N goes high");
             rx_expect_release_after_rxf <= 1'b0;
-         end
-
-         if (tx_expect_release_after_txe) begin
-            if (ft_wr_n !== 1'b1)
-               fail("WR_N must deassert one FT clock after TXE_N goes high");
-            tx_expect_release_after_txe <= 1'b0;
          end
 
          if (prev_ft_oe_n && !ft_oe_n) begin
@@ -662,9 +688,6 @@ module testbench;
 
          if (!prev_ft_rxf_n && ft_rxf_n && ((!ft_oe_n) || (!ft_rd_n)))
             rx_expect_release_after_rxf <= 1'b1;
-
-         if (!prev_ft_txe_n && ft_txe_n && !ft_wr_n)
-            tx_expect_release_after_txe <= 1'b1;
 
          if (dut.fifo_append) begin
             if (!rx_burst_seen) begin
@@ -689,6 +712,9 @@ module testbench;
             expect_tx_word(tx_words_n, ft_data_bus, ft_be_bus);
             tx_words_n <= tx_words_n + 1;
          end
+         else if (tx_burst_seen && !prev_ft_txe_n_neg && !ft_txe_n && !prev_ft_wr_n && (tx_words_n < exp_words_n)) begin
+            fail("WR_N must stay active for a continuous TX burst while TXE_N is low");
+         end
 
          if (!ft_rd_n)
             rx_active_cycles_n <= rx_active_cycles_n + 1;
@@ -697,8 +723,78 @@ module testbench;
 
          prev_ft_oe_n  <= ft_oe_n;
          prev_ft_rd_n  <= ft_rd_n;
-         prev_ft_txe_n <= ft_txe_n;
+         prev_ft_wr_n  <= ft_wr_n;
+         prev_ft_txe_n_neg <= ft_txe_n;
          prev_ft_rxf_n <= ft_rxf_n;
+      end
+   end
+
+   always @(posedge ft_clk or negedge ft_reset_n) begin
+      if (!ft_reset_n) begin
+         prev_ft_txe_n_pos  <= 1'b1;
+         tx_assert_wait     <= 1'b0;
+         tx_release_wait    <= 1'b0;
+         tx_assert_cycles_cur <= 0;
+         tx_release_cycles_cur <= 0;
+         tx_assert_cycles_last <= 0;
+         tx_release_cycles_last <= 0;
+         tx_assert_cycles_max  <= 0;
+         tx_release_cycles_max <= 0;
+         tx_assert_events_n    <= 0;
+         tx_release_events_n   <= 0;
+      end
+      else begin
+         if (tx_assert_wait) begin
+            if (!ft_wr_n) begin
+               tx_assert_wait       <= 1'b0;
+               tx_assert_cycles_last <= tx_assert_cycles_cur;
+               tx_assert_events_n   <= tx_assert_events_n + 1;
+               if (tx_assert_cycles_cur > tx_assert_cycles_max)
+                  tx_assert_cycles_max <= tx_assert_cycles_cur;
+               $display("INFO: TXE_N active to WR_N active latency = %0d FT clocks", tx_assert_cycles_cur + 1);
+            end
+            else
+               tx_assert_cycles_cur <= tx_assert_cycles_cur + 1;
+         end
+
+         if (tx_release_wait) begin
+            if (ft_wr_n) begin
+               tx_release_wait        <= 1'b0;
+               tx_release_cycles_last <= tx_release_cycles_cur;
+               tx_release_events_n    <= tx_release_events_n + 1;
+               if (tx_release_cycles_cur > tx_release_cycles_max)
+                  tx_release_cycles_max <= tx_release_cycles_cur;
+               $display("INFO: TXE_N inactive to WR_N inactive latency = %0d FT clocks", tx_release_cycles_cur + 1);
+            end
+            else
+               tx_release_cycles_cur <= tx_release_cycles_cur + 1;
+         end
+
+         if (prev_ft_txe_n_pos && !ft_txe_n) begin
+            if (ft_wr_n) begin
+               tx_assert_wait      <= 1'b1;
+               tx_assert_cycles_cur <= 0;
+            end
+            else begin
+               tx_assert_cycles_last <= 0;
+               tx_assert_events_n    <= tx_assert_events_n + 1;
+               $display("INFO: TXE_N active to WR_N active latency = 1 FT clock");
+            end
+         end
+
+         if (!prev_ft_txe_n_pos && ft_txe_n) begin
+            if (!ft_wr_n) begin
+               tx_release_wait      <= 1'b1;
+               tx_release_cycles_cur <= 0;
+            end
+            else begin
+               tx_release_cycles_last <= 0;
+               tx_release_events_n    <= tx_release_events_n + 1;
+               $display("INFO: TXE_N inactive to WR_N inactive latency = 1 FT clock");
+            end
+         end
+
+         prev_ft_txe_n_pos <= ft_txe_n;
       end
    end
 
