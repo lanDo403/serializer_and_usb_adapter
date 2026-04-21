@@ -18,6 +18,8 @@ module fifo_fsm
 	input 						full_fifo,
 	input 						empty_fifo,
 	input                  tx_clear_i,
+	input                  soft_clear_i,
+	input                  service_hold_i,
 	input                  tx_prefetch_en_i,
 	
 	output [DATA_LEN-1:0] 		data_o,		// DATA
@@ -28,9 +30,11 @@ module fifo_fsm
 	output   					rd_n,
 	output   					oe_n,
 	output 						drive_tx,
+	output                  idle_o,
+	output                  tx_path_idle_o,
 	output 						fifo_pop,
 	output						fifo_append
-    );
+     );
 	 
 	localparam ARB         = 5'b00001; // Select Recieve or Trancieve mode
 	localparam TX_PREFETCH = 5'b00010; // Request the first TX word from FIFO, prefetch
@@ -74,7 +78,7 @@ module fifo_fsm
 	assign tx_req_w   		= !txe_n && tx_data_valid_ff;
 	assign tx_burst_w		= !txe_n && tx_data_valid_ff;
 	assign tx_send_w        = (state == TX_BURST) && !txe_n && tx_data_valid_ff;
-	assign fifo_pop_w       = tx_prefetch_en_i && !empty_fifo && (
+	assign fifo_pop_w       = !service_hold_i && tx_prefetch_en_i && !empty_fifo && (
 	                          (!tx_data_valid_ff && !tx_prefetch_pending_ff) ||
 	                          ( tx_data_valid_ff && !tx_prefetch_valid_ff && !tx_prefetch_pending_ff) ||
 	                          ((state == TX_BURST) && tx_send_w)
@@ -91,6 +95,8 @@ module fifo_fsm
 	always @(posedge clk) begin
 		if (!rst_n)
 			state <= ARB;
+		else if (soft_clear_i)
+			state <= ARB;
 		else
 			state <= next_state;
 	end
@@ -98,7 +104,8 @@ module fifo_fsm
 	always @(*) begin
 		next_state = state;
 		case(state)
-			ARB:			next_state = (rx_cond_w) ? RX_START : (tx_req_w) ? TX_PREFETCH : ARB;
+			ARB:			next_state = (!service_hold_i && rx_cond_w) ? RX_START :
+			                         (!service_hold_i && tx_req_w) ? TX_PREFETCH : ARB;
 			TX_PREFETCH: 	next_state = (tx_burst_w) ? TX_BURST : TX_PREFETCH;
 			TX_BURST:		next_state = (tx_burst_w) ? TX_BURST : ARB;
 			RX_START:		next_state = RX_BURST;
@@ -112,6 +119,9 @@ module fifo_fsm
 	//-------------------------------------------------------------
 	always @(posedge clk) begin
 		if (!rst_n) begin
+			rxf_n_p1 <= 1'b1;
+		end
+		else if (soft_clear_i) begin
 			rxf_n_p1 <= 1'b1;
 		end
 		else begin
@@ -132,7 +142,7 @@ module fifo_fsm
 			tx_prefetch_valid_ff   <= 1'b0;
 			tx_data_valid_ff       <= 1'b0;
 		end
-		else if (tx_clear_i) begin
+		else if (tx_clear_i || soft_clear_i) begin
 			tx_stage_ff            <= {DATA_LEN{1'b0}};
 			tx_prefetch_ff         <= {DATA_LEN{1'b0}};
 			tx_stage_be_ff         <= {BE_LEN{1'b0}};
@@ -193,7 +203,7 @@ module fifo_fsm
 			tx_data_ff <= {DATA_LEN{1'b0}};
 			be_o_ff    <= {BE_LEN{1'b0}};
 		end
-		else if (tx_clear_i) begin
+		else if (tx_clear_i || soft_clear_i) begin
 			tx_data_ff <= {DATA_LEN{1'b0}};
 			be_o_ff    <= {BE_LEN{1'b0}};
 		end
@@ -221,6 +231,10 @@ module fifo_fsm
 			rx_data_ff <= {DATA_LEN{1'b0}};
 			be_i_ff    <= {BE_LEN{1'b0}};
 		end
+		else if (soft_clear_i) begin
+			rx_data_ff <= {DATA_LEN{1'b0}};
+			be_i_ff    <= {BE_LEN{1'b0}};
+		end
 		else if ((state == RX_START) && !rxf_n_p1 && !full_fifo) begin
 			rx_data_ff <= rx_data;
 			be_i_ff    <= be_i;
@@ -237,6 +251,10 @@ module fifo_fsm
 		if (!rst_n) begin
 			drive_tx_ff   <= 1'b0;
 			fifo_append_ff<= 1'b0;
+		end
+		else if (soft_clear_i) begin
+			drive_tx_ff    <= 1'b0;
+			fifo_append_ff <= 1'b0;
 		end
 		else begin
 			drive_tx_ff    <= 1'b0;
@@ -278,6 +296,8 @@ module fifo_fsm
 	assign rd_n        = rd_w;
 	assign oe_n        = oe_w;
 	assign drive_tx    = drive_tx_ff;
+	assign idle_o      = (state == ARB) && wr_w && rd_w && oe_w && !fifo_append_ff && !drive_tx_ff;
+	assign tx_path_idle_o = idle_o && !tx_data_valid_ff && !tx_prefetch_valid_ff && !tx_prefetch_pending_ff;
 	assign fifo_pop    = fifo_pop_w;
 	assign fifo_append = fifo_append_ff;
 		

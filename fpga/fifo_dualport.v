@@ -9,7 +9,9 @@ module fifo_dualport#(
 	input 						clk_wr,
 	input							clk_rd,
 	input 						rst_wr_n,
-	input 						rst_rd_n,			
+	input 						rst_rd_n,
+	input                   soft_clear_wr_i,
+	input                   soft_clear_rd_i,
 	input 						wen_i, // write enable from packer8to32	
 	input 						ren_i,  // read enable from FT601
 	input [DATA_LEN-1:0] 	sram_data_r,
@@ -53,6 +55,12 @@ module fifo_dualport#(
 			full_ff <= 0;
 			overflow_ff <= 1'b0;
 		end
+		else if (soft_clear_wr_i) begin
+			wr_ptr_bin <= 0;
+			wr_ptr_gray <= 0;
+			full_ff <= 0;
+			overflow_ff <= 1'b0;
+		end
 		else begin
 			wr_ptr_bin <= wr_ptr_bin_next;
 			wr_ptr_gray <= wr_ptr_gray_next;
@@ -79,6 +87,11 @@ module fifo_dualport#(
 			rd_ptr_gray <= 0;
 			empty_ff <= 1;
 		end
+		else if (soft_clear_rd_i) begin
+			rd_ptr_bin <= 0;
+			rd_ptr_gray <= 0;
+			empty_ff <= 1;
+		end
 		else begin
 			rd_ptr_bin <= rd_ptr_bin_next;
 			rd_ptr_gray <= rd_ptr_gray_next;
@@ -87,7 +100,7 @@ module fifo_dualport#(
 			//	rd_data <= sram_data_r;
 		end
 	end
-	
+
 	always @(*) begin
 		ren_do = ren_i & ~empty;
 		rd_ptr_bin_next = rd_ptr_bin + {{ADDR_LEN{1'b0}}, ren_do};
@@ -102,6 +115,10 @@ module fifo_dualport#(
 			rd_ptr_gray_sync1 <= 0;
 			rd_ptr_gray_sync2 <= 0;
 		end
+		else if (soft_clear_wr_i) begin
+			rd_ptr_gray_sync1 <= 0;
+			rd_ptr_gray_sync2 <= 0;
+		end
 		else begin
 			rd_ptr_gray_sync1 <= rd_ptr_gray;
 			rd_ptr_gray_sync2 <= rd_ptr_gray_sync1;
@@ -110,6 +127,10 @@ module fifo_dualport#(
 	
 	always @(posedge clk_rd) begin
 		if (!rst_rd_n) begin
+			wr_ptr_gray_sync1 <= 0;
+			wr_ptr_gray_sync2 <= 0;
+		end
+		else if (soft_clear_rd_i) begin
 			wr_ptr_gray_sync1 <= 0;
 			wr_ptr_gray_sync2 <= 0;
 		end
@@ -143,6 +164,8 @@ module fifo_dualport#(
 			
 			always @(posedge clk_rd) begin
 				if (!rst_rd_n)
+					underflow_ff <= 1'b0;
+				else if (soft_clear_rd_i)
 					underflow_ff <= 1'b0;
 				else if (ren_i && empty_ff)
 					underflow_ff <= 1'b1;

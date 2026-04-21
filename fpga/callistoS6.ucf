@@ -97,7 +97,7 @@ TIMEGRP "M_FIFO_IO" OFFSET = IN 4 ns VALID 6.5 ns BEFORE "CLK" RISING;
 # RXF_N/TXE_N are captured by explicit FT-domain input registers in ft601_io.
 # Timing for these control flags must terminate on that boundary and must not
 # leak into deeper control/datapath endpoints inside the FSM or FIFOs.
-TIMEGRP "M_FLAG_I" OFFSET = IN 4 ns VALID 6.5 ns BEFORE "CLK" RISING;
+TIMEGRP "M_FLAG_I" OFFSET = IN 4 ns VALID 7.5 ns BEFORE "CLK" RISING;
 
 TIMEGRP "M_FIFO_IO" OFFSET = OUT 14 ns VALID 9.2 ns AFTER "CLK" RISING;
 TIMEGRP "M_FIFO_O" OFFSET = OUT 14 ns VALID 9.2 ns AFTER "CLK" RISING;

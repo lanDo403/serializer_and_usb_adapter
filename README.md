@@ -1,4 +1,4 @@
-# Система высокоскоростного обмена данными на базе ПЛИС с использованием интерфейса USB 3.0
+﻿# Система высокоскоростного обмена данными на базе ПЛИС с использованием интерфейса USB 3.0
 
 Этот репозиторий содержит RTL, ограничения и документацию для тракта обмена данными на базе `Xilinx Spartan-6` и `FTDI FT601` в режиме `245 synchronous FIFO`.
 
@@ -57,12 +57,14 @@
 Ключевые модули:
 
 - `top.v` — верхний уровень;
+- `bit_sync.v` — двухтактный синхронизатор одиночного бита между доменами;
 - `ft601_io.v` — физическая обвязка FT601 и входная регистрация `TXE_N/RXF_N`;
 - `fifo_fsm.v` — handshake и burst-логика FT601;
 - `fifo_dualport.v` + `sram_dualport.v` — асинхронный TX FIFO между GPIO и FT domain;
 - `fifo_singleclock.v` — loopback FIFO в домене `ft_clk_i`;
-- `fifo_rx_ctrl.v` — потоковый декодер команд FT601 RX path;
-- `fifo_tx_ctrl.v` — управление записью в TX FIFO и sticky TX error;
+- `loopback_ft_ctrl.v` — FT-domain логика захвата RX-слов и управления loopback/TX prefetch;
+- `host_cmd_ctrl.v` — потоковый декодер команд FT601 RX path;
+- `tx_write_guard.v` — управление записью в TX FIFO и sticky TX error;
 - `rst_sync.v` — синхронизация reset по доменам;
 - `testbench.v` — основной проверочный стенд;
 - `callistoS6.ucf` — pinout и timing constraints для Callisto S6.
@@ -130,3 +132,4 @@
 3. `fpga/top.v` — верхний уровень и реальный datapath.
 4. `fpga/testbench.v` — проверка текущего поведения дизайна.
 5. `ft601_test/README.md` — host-side проверка FT601 через D3XX.
+

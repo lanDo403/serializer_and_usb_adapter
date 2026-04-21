@@ -7,6 +7,7 @@ module fifo_singleclock #(
 )(
 	input                    clk,
 	input                    rst_n,
+	input                    soft_clear_i,
 	input                    wen_i,
 	input                    ren_i,
 	input  [DATA_LEN-1:0]    data_i,
@@ -26,20 +27,20 @@ module fifo_singleclock #(
 	reg overflow_ff;
 	reg underflow_ff;
 
-	wire wen_do_w;
-	wire ren_do_w;
-	wire [ADDR_LEN:0] wr_ptr_next_w;
-	wire [ADDR_LEN:0] rd_ptr_next_w;
-	wire full_next_w;
-	wire empty_next_w;
+	wire wen_do;
+	wire ren_do;
+	wire [ADDR_LEN:0] wr_ptr_next;
+	wire [ADDR_LEN:0] rd_ptr_next;
+	wire full_next;
+	wire empty_next;
 
-	assign wen_do_w = wen_i && !full_ff;
-	assign ren_do_w = ren_i && !empty_ff;
-	assign wr_ptr_next_w = wr_ptr_ff + {{ADDR_LEN{1'b0}}, wen_do_w};
-	assign rd_ptr_next_w = rd_ptr_ff + {{ADDR_LEN{1'b0}}, ren_do_w};
-	assign empty_next_w = (wr_ptr_next_w == rd_ptr_next_w);
-	assign full_next_w = (wr_ptr_next_w[ADDR_LEN] != rd_ptr_next_w[ADDR_LEN]) &&
-	                     (wr_ptr_next_w[ADDR_LEN-1:0] == rd_ptr_next_w[ADDR_LEN-1:0]);
+	assign wen_do = wen_i && !full_ff;
+	assign ren_do = ren_i && !empty_ff;
+	assign wr_ptr_next = wr_ptr_ff + {{ADDR_LEN{1'b0}}, wen_do};
+	assign rd_ptr_next = rd_ptr_ff + {{ADDR_LEN{1'b0}}, ren_do};
+	assign empty_next = (wr_ptr_next == rd_ptr_next);
+	assign full_next = (wr_ptr_next[ADDR_LEN] != rd_ptr_next[ADDR_LEN]) &&
+	                   (wr_ptr_next[ADDR_LEN-1:0] == rd_ptr_next[ADDR_LEN-1:0]);
 
 	always @(posedge clk) begin
 		if (!rst_n) begin
@@ -51,21 +52,30 @@ module fifo_singleclock #(
 			overflow_ff <= 1'b0;
 			underflow_ff <= 1'b0;
 		end
+		else if (soft_clear_i) begin
+			wr_ptr_ff <= {ADDR_LEN+1{1'b0}};
+			rd_ptr_ff <= {ADDR_LEN+1{1'b0}};
+			data_ff <= {DATA_LEN{1'b0}};
+			full_ff <= 1'b0;
+			empty_ff <= 1'b1;
+			overflow_ff <= 1'b0;
+			underflow_ff <= 1'b0;
+		end
 		else begin
-			if (wen_do_w)
+			if (wen_do)
 				mem[wr_ptr_ff[ADDR_LEN-1:0]] <= data_i;
 			else if (wen_i && full_ff)
 				overflow_ff <= 1'b1;
 
-			if (ren_do_w)
+			if (ren_do)
 				data_ff <= mem[rd_ptr_ff[ADDR_LEN-1:0]];
 			else if (ren_i && empty_ff)
 				underflow_ff <= 1'b1;
 
-			wr_ptr_ff <= wr_ptr_next_w;
-			rd_ptr_ff <= rd_ptr_next_w;
-			full_ff <= full_next_w;
-			empty_ff <= empty_next_w;
+			wr_ptr_ff <= wr_ptr_next;
+			rd_ptr_ff <= rd_ptr_next;
+			full_ff <= full_next;
+			empty_ff <= empty_next;
 		end
 	end
 
