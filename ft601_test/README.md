@@ -1,25 +1,34 @@
-﻿# FT601 Console App
+# FT601 Console App
 
 ## Назначение
-`main_gpp.exe` — простая консольная утилита для ручной работы с `FT601` через `D3XX API`.
 
-Утилита поддерживает два типа операций:
+`main_gpp.exe` — простая консольная утилита для ручной проверки `FT601` через `D3XX API`.
+
+Утилита разделяет два типа операций:
 - `raw payload` через `EP02` (`0x02`) и `EP82` (`0x82`);
-- `service protocol` для управления прошивкой FPGA и чтения ее статуса.
+- `service protocol` для управления текущей RTL-прошивкой FPGA и чтения статуса.
 
 При старте программа:
 - открывает устройство по `DEVICE_INDEX = 0`;
-- настраивает таймауты `FT_SetPipeTimeout` для `0x02` и `0x82`;
-- проверяет через `FT_GetPipeInformation`, что bulk pipe pair `0x02/0x82` реально существует;
-- показывает простое консольное меню.
+- выводит краткую информацию о выбранном устройстве;
+- проверяет bulk pipe pair `0x02/0x82` через `FT_GetPipeInformation`;
+- настраивает `FT_SetPipeTimeout` для обоих pipe;
+- показывает flat console menu.
 
+
+## Структура исходников
+
+- `main.cpp` — меню, dispatch операций и retry/reopen flow.
+- `ft601_device.h/.cpp` — открытие устройства, pipe discovery, raw D3XX read/write, reopen и pipe abort.
+- `service_protocol.h/.cpp` — framed service protocol, opcodes, status frame и декодирование `status_word`.
+- `payload_test.h/.cpp` — deterministic payload, raw test write и loopback integrity compare.
 ## Service protocol
 
-Команда в FPGA передается framed protocol из двух 32-битных слов по `EP02`:
+Команда в FPGA передается двумя 32-битными словами по `EP02`:
 1. `CMD_MAGIC = 0xA55A5AA5`
 2. `opcode`
 
-Ответ на `CMD_GET_STATUS` приходит по `EP82` тоже двумя 32-битными словами:
+Ответ на `CMD_GET_STATUS` читается двумя 32-битными словами по `EP82`:
 1. `STATUS_MAGIC = 0x5AA55AA5`
 2. `status_word`
 
@@ -41,27 +50,40 @@
 - `bit[6]` — `loopback_fifo_full`
 - `bit[31:7]` — `0`
 
-Утилита работает в stop-and-wait режиме:
-- одна service-команда;
-- затем ожидание эффекта;
-- для `SET_*` и `CLR_*` сразу выполняется `GET_STATUS` и печатается подтверждение.
+Service-команды выполняются в stop-and-wait режиме. Для `SET_*` и `CLR_*` утилита сразу делает `GET_STATUS` как подтверждение.
 
 ## Меню
-1. `Write test payload` — отправляет `64` 32-битных слов `1..64` в `EP02`.
-2. `Read payload to file` — читает raw payload из `EP82` до таймаута и сохраняет в `rx_dump.bin`.
-3. `Get FPGA status` — отправляет `CMD_GET_STATUS` и печатает `status_word`.
-4. `Set loopback mode` — отправляет `CMD_SET_LOOPBACK`, затем автоматически читает статус.
-5. `Set normal mode` — отправляет `CMD_SET_NORMAL`, затем автоматически читает статус.
-6. `Clear TX error` — отправляет `CMD_CLR_TX_ERROR`, затем автоматически читает статус.
-7. `Clear RX error` — отправляет `CMD_CLR_RX_ERROR`, затем автоматически читает статус.
-8. `Clear all errors` — отправляет `CMD_CLR_ALL_ERROR`, затем автоматически читает статус.
-9. `Exit`
+
+1. `Write test payload` — отправляет `64` 32-битных слова `1..64` в `EP02`.
+2. `Read payload to file` — читает raw payload из `EP82` до timeout/пустого чтения и сохраняет в `rx_dump.bin`.
+3. `Loopback integrity test` — включает loopback, пишет deterministic payload, читает ровно тот же размер и сравнивает данные.
+4. `Get FPGA status` — отправляет `CMD_GET_STATUS` и печатает `status_word`.
+5. `Set loopback mode` — отправляет `CMD_SET_LOOPBACK`, затем автоматически читает статус.
+6. `Set normal mode` — отправляет `CMD_SET_NORMAL`, затем автоматически читает статус.
+7. `Clear TX error` — отправляет `CMD_CLR_TX_ERROR`, затем автоматически читает статус.
+8. `Clear RX error` — отправляет `CMD_CLR_RX_ERROR`, затем автоматически читает статус.
+9. `Clear all errors` — отправляет `CMD_CLR_ALL_ERROR`, затем автоматически читает статус.
+10. `Exit`
 
 Важно:
-- `Read payload to file` — это только raw dump, а не чтение статуса;
-- статус читается только через `Get FPGA status` или автоматический `GET_STATUS` после service-команды.
+- `Read payload to file` — это raw dump, а не чтение статуса;
+- status frame читается только через `Get FPGA status` или автоматический `GET_STATUS` после service-команды;
+- `Loopback integrity test` по умолчанию использует `1024` слова, максимум `1048576` слов.
+
+## Loopback integrity test
+
+Сценарий проверки:
+1. `CMD_SET_LOOPBACK`.
+2. `CMD_GET_STATUS` и проверка `loopback_mode = 1`.
+3. Генерация deterministic payload.
+4. Запись payload в `EP02`.
+5. Чтение ровно такого же количества слов из `EP82`.
+6. Сравнение `tx payload` и `rx payload`.
+
+При mismatch печатается первый word index, byte offset, expected и actual value.
 
 ## Требования
+
 - Windows.
 - Установленный D3XX драйвер для FT601.
 - `FTD3XXWU.dll` доступна рядом с `.exe` или через `PATH`.
@@ -71,11 +93,12 @@
 Если использовать 32-битный `g++`, линковка с `x64` библиотекой не пройдет.
 
 ## Сборка
+
 Проверенная команда сборки для `MSYS2 MinGW x64`:
 
 ```powershell
 cd C:\Users\userIvan\Desktop\my_projects\logic_analyzer\ft601_test
-& 'C:\msys64\mingw64\bin\g++.exe' -std=c++11 -Wall -Wextra -pedantic main.cpp -I. -L.\WU_FTD3XXLib\Lib\Dynamic\x64 -lFTD3XXWU -o main_gpp.exe
+& 'C:\msys64\mingw64\bin\g++.exe' -std=c++11 -Wall -Wextra -pedantic main.cpp ft601_device.cpp service_protocol.cpp payload_test.cpp -I. -L.\WU_FTD3XXLib\Lib\Dynamic\x64 -lFTD3XXWU -o main_gpp.exe
 ```
 
 ## Запуск
@@ -86,7 +109,9 @@ cd C:\Users\userIvan\Desktop\my_projects\logic_analyzer\ft601_test
 ```
 
 ## Обработка ошибок
+
 - При ошибке записи выполняется `FT_AbortPipe(0x02)`.
-- При ошибке чтения или ошибке status frame выполняется `FT_AbortPipe(0x82)`.
-- При статусах отключения устройства (`FT_DEVICE_NOT_CONNECTED`, `FT_DEVICE_NOT_FOUND`, `FT_INVALID_HANDLE`) утилита делает попытку `reopen` и повторяет операцию один раз.
-- Если в статусном ответе первым словом пришел не `STATUS_MAGIC`, это считается protocol error.
+- При ошибке чтения, timeout или protocol error выполняется `FT_AbortPipe(0x82)`.
+- При disconnect-статусах (`FT_DEVICE_NOT_CONNECTED`, `FT_DEVICE_NOT_FOUND`, `FT_INVALID_HANDLE`) утилита делает попытку reopen и повторяет операцию один раз.
+- Если первым словом status frame пришел не `STATUS_MAGIC`, это protocol error.
+- Физический `RESET_N` FT601 не управляется этой программой; он связан с `FPGA_RESET` в RTL.
