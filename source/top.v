@@ -1,8 +1,8 @@
 `timescale 1ns / 1ps
 
 // This project is divided by two frequency domains. Write domain works on GPIO_CLK from input gpio pin (frequency is changeable). 
-// Write domain includes modules such as get_gpio, packer8to32, fifo_dualport(write side) and sram_dp(write side).
-// Read domain works on CLK from FT601 (100MHZ). Read domain includes modules such as fifo_dualport(read side), sram_dp(read side), loopback and fifo_fsm.
+// Write domain includes modules such as gpio_wrapper, packer8to32, async_fifo(write side) and sram_dp(write side).
+// Read domain works on CLK from FT601 (100MHZ). Read domain includes modules such as async_fifo(read side), sram_dp(read side), loopback and ft601_fsm.
 
 module top #(
 	parameter GPIO_LEN = 8,
@@ -18,7 +18,7 @@ module top #(
 	input   						GPIO_STROB,	
 	input 						FPGA_RESET,
    input 						CLK,		// Clock signal from FT601
-	input 						RESET_N,	// Active-low reset signal from FT601	
+	output 						RESET_N,	// Active-low reset signal driven to FT601
    input 						TXE_N,		// Trancieve empty signal from FT601
    input 						RXF_N,		// Receive full signal from FT601
    output 						OE_N,		// Output enable signal to FT601
@@ -29,119 +29,149 @@ module top #(
 	 );
 	localparam [BE_LEN-1:0] FULL_BE = {BE_LEN{1'b1}};
 	
-	//-----gpio-----
-	wire [GPIO_LEN-1:0] gpio_data; 	// from GPIO module to packer8to32 module
-	wire gpio_strob;	// GPIO strobe (valid signal)	
-	wire gpio_clk;	// GPIO clock signal in write  
-	
-	//-----packer-----
-	wire packer_valid_o;
-	wire [DATA_LEN-1:0]	packer_data_o;
-	
-	//-----fifo-----
-	wire [DATA_LEN-1:0]	fifo_data_i;
-	wire [DATA_LEN-1:0]	fifo_data_o;
-	wire [ADDR_LEN-1:0] fifo_addr_wr, fifo_addr_rd;
-	wire [DATA_LEN-1:0] sram_in, sram_out; // Data to/from SRAM
-	wire full_fifo;
-	wire empty_fifo;
-	wire fifo_wen_o, fifo_ren_o;
-	wire tx_fifo_overflow;
-	wire tx_fifo_underflow;
-	wire packer_wen_i;
-	wire packer_wen_raw;
-	wire tx_fifo_error_i; // Sticky TX-side error collected in CLK domain and synchronized into lvds_clk.
-	wire tx_fifo_error_wr_gpio; // GPIO-domain sticky TX error from tx_write_guard.
-	wire tx_fifo_error_wr_ft; // FT-domain synchronized copy of GPIO TX error.
-	wire [DATA_LEN-1:0] fsm_tx_fifo_data_i; // Selected TX source for FT601: normal TX FIFO or loopback FIFO.
-	wire [BE_LEN-1:0]   fsm_tx_fifo_be_i; // Selected TX byte-enable source.
-	wire                fsm_tx_fifo_empty_i; // Empty flag for the currently selected TX source.
-	wire                fifo_tx_pop_i; // Pop command routed to normal TX FIFO.
-	wire [FIFO_RX_LEN-1:0] loopback_fifo_data_i;
-	wire [FIFO_RX_LEN-1:0] loopback_fifo_data_o;
-	wire full_loopback_fifo;
-	wire empty_loopback_fifo;
-	wire rx_fifo_overflow;
-	wire rx_fifo_underflow;
-	wire rx_fifo_error_i; // Sticky RX-side error reported by the command decoder block.
-	wire loopback_mode_ft; // Runtime loopback mode latched in FT clock domain by command decoder.
-	wire loopback_mode_gpio; // Loopback mode synchronized into the GPIO domain.
-	wire service_hold_ft; // FT-domain hold while mode switch is in progress.
-	wire service_hold_gpio; // GPIO-domain copy of service hold used to block new writes.
-	wire fsm_rx_full_i; // Selected receive-side backpressure source for the FSM.
-	wire gpio_rst_n_i; // Active-low synchronous reset for the GPIO/write clock domain.
-	wire ft_rst_n_i; // Active-low synchronous reset for the FT601/read clock domain.
-	wire fpga_reset_i; // Buffered FPGA reset input.
-	wire ft_reset_i; // Active-high reset request derived from FT601 RESET_N.
-	wire ft_rst_req; // Combined asynchronous reset request that is synchronized into FT clock domain.
-	wire [FIFO_RX_LEN-1:0] ft_rx_word_raw;
-	wire ft_rx_word_valid;
-	wire [FIFO_RX_LEN-1:0] ft_rx_word;
-	wire loopback_fifo_wen_i;
-	wire tx_prefetch_en;
-	wire tx_source_change;
-	wire soft_clear_tx_req_ft; // Internal FT-domain request used by testbench in stage-2 soft-clear checks.
-	wire soft_clear_rx_req_ft; // Internal FT-domain request for loopback FIFO soft clear.
-	wire soft_clear_ft_state_req_ft; // Internal FT-domain request for FSM/loopback state soft clear.
-	wire soft_clear_tx_ft; // FT-domain pulse that clears the read side of the async TX path.
-	wire soft_clear_tx_gpio; // GPIO-domain pulse that clears the write side of the async TX path.
-	wire status_req;
-	wire status_source_sel;
-	wire status_source_empty;
-	wire status_source_change;
-	wire tx_fifo_full_ft;
-	wire [DATA_LEN-1:0] status_word;
-	 
-	//-----sram-----
-	// ***wire wr_en_sram, rd_en_sram_n;
-	// ***wire [ADDR_LEN-1:0] wr_addr_sram, rd_addr_sram;
+	// Reset and clocks
+	wire gpio_clk;
+	wire ft_clk_i;
+	wire fpga_reset_i;
+	wire ft601_reset_n_i;
+	wire gpio_rst_req;
+	wire ft_rst_req;
+	wire gpio_rst_n_i;
+	wire ft_rst_n_i;
 
-	//-----fsm-----
-	// tx sends data from FPGA to FT601
-	// rx recieves data from FT601 to FPGA
-	wire ft_clk_i; // Buffered FT601 clock used by the full read domain.
-	wire ft_reset_n_i; // Buffered active-low FT601 RESET_N.
-	wire ft_txe_n_i; // Buffered FT601 TXE# sampled inside FPGA.
-	wire ft_rxf_n_i; // Buffered FT601 RXF# sampled inside FPGA.
+	// FT601 wrapper / FSM pins
+	wire ft_txe_n_i;
+	wire ft_rxf_n_i;
 	wire [DATA_LEN-1:0] rx_data;
 	wire [DATA_LEN-1:0] tx_data;
 	wire [BE_LEN-1:0] rx_be;
-	wire [BE_LEN-1:0]	tx_be;
+	wire [BE_LEN-1:0] tx_be;
 	wire fsm_oe_o;
 	wire fsm_wr_o;
 	wire fsm_rd_o;
 	wire fsm_idle_o;
-	wire fsm_tx_path_idle_o;
+	wire drive_tx;
+
+	// GPIO wrapper and packer
+	wire [GPIO_LEN-1:0] gpio_data;
+	wire gpio_strob;
+	wire packer_valid_o;
+	wire [DATA_LEN-1:0] packer_data_o;
+	wire packer_wen_i;
+
+	// Normal TX async FIFO and SRAM
+	wire [DATA_LEN-1:0] normal_fifo_wdata;
+	wire [DATA_LEN-1:0] normal_fifo_rdata;
+	wire [ADDR_LEN-1:0] normal_fifo_waddr;
+	wire [ADDR_LEN-1:0] normal_fifo_raddr;
+	wire [DATA_LEN-1:0] sram_in;
+	wire [DATA_LEN-1:0] sram_out;
+	wire normal_fifo_full;
+	wire normal_fifo_empty;
+	wire normal_fifo_wen;
+	wire normal_fifo_ren;
+	wire tx_fifo_full_ft;
+	wire tx_fifo_clear_ft;
+	wire tx_fifo_clear_gpio;
+
+	// Loopback FIFO
+	wire [FIFO_RX_LEN-1:0] loop_fifo_wdata;
+	wire [FIFO_RX_LEN-1:0] loop_fifo_rdata;
+	wire loop_fifo_full;
+	wire loop_fifo_empty;
+	wire loop_fifo_wen;
+
+	// RX stream router
+	wire ft_rx_axis_tvalid;
+	wire ft_rx_axis_tready;
+	wire [DATA_LEN-1:0] ft_rx_axis_tdata;
+	wire [BE_LEN-1:0] ft_rx_axis_tkeep;
+	wire [FIFO_RX_LEN-1:0] ft_rx_word_raw;
+	wire ft_rx_word_valid;
+	wire [FIFO_RX_LEN-1:0] ft_rx_word;
+	wire fifo_append;
+	wire tx_prefetch_en;
+	wire tx_source_change;
+
+	// Service command decoder and diagnostics
+	wire tx_error;
+	wire rx_error;
+	wire tx_fifo_error_wr_gpio;
+	wire tx_fifo_error_wr_ft;
+	wire tx_fifo_rd_underflow_event;
+	wire loopback_wr_overflow_event;
+	wire loopback_rd_underflow_event;
+	wire loopback_mode_ft;
+	wire loopback_mode_gpio;
+	wire service_hold_ft;
+	wire service_hold_gpio;
+	wire tx_recovery_clear_req_ft;
+	wire rx_recovery_clear_req_ft;
+	wire ft_state_clear_req_ft;
+	wire tx_prefetch_flush_req_ft;
+	wire status_req;
+
+	// Status source
+	wire status_source_sel;
+	wire status_source_empty;
 	wire status_issue_window;
-	wire drive_tx; // when is active - drives data on DATA bus to FT601
-	wire [DATA_LEN-1:0] fsm_data_o; // data from ft601
-	wire [BE_LEN-1:0] fsm_be_o; // byte enable from ft601
-	wire fifo_pop;	// when is active - fsm is ready to get data from fifo
-	wire fifo_append; // when is active - data from ft601 drives to fifo
-	
-	
+	wire [DATA_LEN-1:0] status_word;
+
+	// Local stream contracts between payload/status sources, the TX arbiter and
+	// FT601 adapters. This is a small valid/ready layer, not a full AXI fabric.
+	wire normal_axis_tvalid;
+	wire normal_axis_tready;
+	wire [DATA_LEN-1:0] normal_axis_tdata;
+	wire [BE_LEN-1:0] normal_axis_tkeep;
+	wire loopback_axis_tvalid;
+	wire loopback_axis_tready;
+	wire [DATA_LEN-1:0] loopback_axis_tdata;
+	wire [BE_LEN-1:0] loopback_axis_tkeep;
+	wire status_axis_tvalid;
+	wire status_axis_tready;
+	wire [DATA_LEN-1:0] status_axis_tdata;
+	wire [BE_LEN-1:0] status_axis_tkeep;
+	wire tx_axis_tvalid;
+	wire tx_axis_tready;
+	wire [DATA_LEN-1:0] tx_axis_tdata;
+	wire [BE_LEN-1:0] tx_axis_tkeep;
+	wire rx_axis_tvalid;
+	wire rx_axis_tready;
+	wire [DATA_LEN-1:0] rx_axis_tdata;
+	wire [BE_LEN-1:0] rx_axis_tkeep;
+
 	// Assignings
-	assign fifo_data_i = packer_data_o;
-	// TX source is selected at runtime:
-	// normal mode uses the GPIO/TX FIFO, loopback mode reuses words captured into the FT-domain loopback FIFO.
-	assign fsm_tx_fifo_data_i  = status_source_sel ? status_word :
-	                            loopback_mode_ft ? loopback_fifo_data_o[DATA_LEN-1:0] :
-	                            fifo_data_o;
-	assign fsm_tx_fifo_be_i    = status_source_sel ? FULL_BE :
-	                            loopback_mode_ft ? loopback_fifo_data_o[FIFO_RX_LEN-1:DATA_LEN] :
-	                            {BE_LEN{1'b1}};
-	assign fsm_tx_fifo_empty_i = status_source_sel ? status_source_empty :
-	                            loopback_mode_ft ? empty_loopback_fifo :
-	                            empty_fifo;
-	assign fifo_tx_pop_i       = (!status_source_sel && !loopback_mode_ft) ? fifo_pop : 1'b0;
-	assign packer_wen_i        = packer_wen_raw && !loopback_mode_gpio && !service_hold_gpio;
-	assign ft_rx_word_raw      = {fsm_be_o, fsm_data_o};
-	assign fsm_rx_full_i = loopback_mode_ft ? full_loopback_fifo : 1'b0;
-	assign status_issue_window = fsm_tx_path_idle_o &&
-	                            (loopback_mode_ft ? empty_loopback_fifo : empty_fifo);
-	assign ft_reset_i = ~ft_reset_n_i;
-	assign ft_rst_req = fpga_reset_i | ft_reset_i;
-	assign soft_clear_tx_ft = soft_clear_tx_req_ft;
+	assign normal_fifo_wdata = packer_data_o;
+
+	assign normal_axis_tvalid = !normal_fifo_empty;
+	assign normal_axis_tdata  = normal_fifo_rdata;
+	assign normal_axis_tkeep  = FULL_BE;
+
+	assign loopback_axis_tvalid = !loop_fifo_empty;
+	assign loopback_axis_tdata  = loop_fifo_rdata[DATA_LEN-1:0];
+	assign loopback_axis_tkeep  = loop_fifo_rdata[FIFO_RX_LEN-1:DATA_LEN];
+
+	assign status_axis_tvalid = status_source_sel && !status_source_empty;
+	assign status_axis_tdata  = status_word;
+	assign status_axis_tkeep  = FULL_BE;
+
+	assign rx_axis_tvalid = ft_rx_word_valid;
+	assign rx_axis_tready = 1'b1;
+	assign rx_axis_tdata  = ft_rx_word[DATA_LEN-1:0];
+	assign rx_axis_tkeep  = ft_rx_word[FIFO_RX_LEN-1:DATA_LEN];
+
+	assign normal_fifo_ren       = normal_axis_tready;
+	assign tx_fifo_rd_underflow_event = normal_fifo_ren && normal_fifo_empty;
+	assign loopback_wr_overflow_event = loop_fifo_wen && loop_fifo_full;
+	assign loopback_rd_underflow_event = loopback_axis_tready && loop_fifo_empty;
+	assign ft_rx_word_raw      = {ft_rx_axis_tkeep, ft_rx_axis_tdata};
+	assign ft_rx_axis_tready   = loopback_mode_ft ? !loop_fifo_full : 1'b1;
+	assign fifo_append         = ft_rx_axis_tvalid;
+	assign status_issue_window = fsm_idle_o;
+	assign ft601_reset_n_i = ~fpga_reset_i;
+	assign gpio_rst_req = fpga_reset_i;
+	assign ft_rst_req = fpga_reset_i;
+	assign tx_fifo_clear_ft = tx_recovery_clear_req_ft;
 
 	IBUF #(
 		.IOSTANDARD("LVCMOS33")
@@ -151,10 +181,10 @@ module top #(
 	);
 	
 	// FT601 physical I/O wrapper
-	ft601_io #(
+	ft601_wrapper #(
 		.DATA_LEN(DATA_LEN),
 		.BE_LEN(BE_LEN)
-	) ft_io (
+	) ft601_wrapper (
 		.CLK(CLK),
 		.RESET_N(RESET_N),
 		.TXE_N(TXE_N),
@@ -165,7 +195,8 @@ module top #(
 		.BE(BE),
 		.DATA(DATA),
 		.clk_o(ft_clk_i),
-		.reset_n_o(ft_reset_n_i),
+		.ft601_reset_n_i(ft601_reset_n_i),
+		.core_rst_n_i(ft_rst_n_i),
 		.txe_n_o(ft_txe_n_i),
 		.rxf_n_o(ft_rxf_n_i),
 		.rx_be_o(rx_be),
@@ -181,7 +212,7 @@ module top #(
 	// Synchronizers per clock domain
 	rst_sync gpio_rst_sync (
 		.clk(gpio_clk),
-		.arst_i(fpga_reset_i),
+		.arst_i(gpio_rst_req),
 		.rst_n_o(gpio_rst_n_i)
 	);
 
@@ -214,7 +245,7 @@ module top #(
 	) tx_fifo_full_ft_sync (
 		.clk(ft_clk_i),
 		.rst_n(ft_rst_n_i),
-		.din(full_fifo),
+		.din(normal_fifo_full),
 		.dout(tx_fifo_full_ft)
 	);
 
@@ -227,63 +258,87 @@ module top #(
 		.dout(tx_fifo_error_wr_ft)
 	);
 
-	pulse_sync soft_clear_tx_gpio_sync (
+	pulse_sync tx_fifo_clear_gpio_sync (
 		.src_clk(ft_clk_i),
 		.src_rst_n(ft_rst_n_i),
 		.dst_clk(gpio_clk),
 		.dst_rst_n(gpio_rst_n_i),
-		.pulse_i(soft_clear_tx_req_ft),
-		.pulse_o(soft_clear_tx_gpio)
+		.pulse_i(tx_recovery_clear_req_ft),
+		.pulse_o(tx_fifo_clear_gpio)
+	);
+
+	// Explicit TX stream priority: status response, then loopback, then normal payload.
+	axis_tx_arbiter #(
+		.DATA_LEN(DATA_LEN),
+		.BE_LEN(BE_LEN)
+	) axis_tx_arbiter (
+		.status_lock_i(status_source_sel),
+		.loopback_sel_i(loopback_mode_ft),
+		.s_normal_valid_i(normal_axis_tvalid),
+		.s_normal_ready_o(normal_axis_tready),
+		.s_normal_data_i(normal_axis_tdata),
+		.s_normal_keep_i(normal_axis_tkeep),
+		.s_loopback_valid_i(loopback_axis_tvalid),
+		.s_loopback_ready_o(loopback_axis_tready),
+		.s_loopback_data_i(loopback_axis_tdata),
+		.s_loopback_keep_i(loopback_axis_tkeep),
+		.s_status_valid_i(status_axis_tvalid),
+		.s_status_ready_o(status_axis_tready),
+		.s_status_data_i(status_axis_tdata),
+		.s_status_keep_i(status_axis_tkeep),
+		.m_valid_o(tx_axis_tvalid),
+		.m_ready_i(tx_axis_tready),
+		.m_data_o(tx_axis_tdata),
+		.m_keep_o(tx_axis_tkeep)
 	);
 
 	// Loopback control
-	loopback_ft_ctrl #(
+	rx_stream_router #(
 		.FIFO_RX_LEN(FIFO_RX_LEN),
 		.BE_LEN(BE_LEN)
-	) loopback_ctrl (
+	) rx_stream_router (
 		.clk(ft_clk_i),
 		.rst_n(ft_rst_n_i),
-		.soft_clear_i(soft_clear_ft_state_req_ft),
-		.service_hold_i(service_hold_ft),
+		.clear_i(ft_state_clear_req_ft),
+		.hold_i(service_hold_ft),
 		.loopback_mode_i(loopback_mode_ft),
-		.ft_rxf_n_i(ft_rxf_n_i),
-		.fifo_append_i(fifo_append),
-		.rx_word_i(ft_rx_word_raw),
-		.ft_rx_word_valid_o(ft_rx_word_valid),
-		.ft_rx_word_o(ft_rx_word),
-		.loopback_fifo_wen_o(loopback_fifo_wen_i),
-		.loopback_fifo_word_o(loopback_fifo_data_i),
-		.tx_prefetch_en_o(tx_prefetch_en),
-		.tx_source_change_o(tx_source_change)
+		.rxf_n_i(ft_rxf_n_i),
+		.s_valid_i(fifo_append),
+		.s_word_i(ft_rx_word_raw),
+		.m_cmd_valid_o(ft_rx_word_valid),
+		.m_cmd_word_o(ft_rx_word),
+		.m_loopback_valid_o(loop_fifo_wen),
+		.m_loopback_word_o(loop_fifo_wdata),
+		.prefetch_en_o(tx_prefetch_en),
+		.source_flush_o(tx_source_change)
 	);
 
-	// Status control
-	status_ft_ctrl #(
+	// Status response control
+	status_source #(
 		.DATA_LEN(DATA_LEN)
-	) status_ctrl (
+	) status_source (
 		.clk(ft_clk_i),
 		.rst_n(ft_rst_n_i),
-		.soft_clear_i(soft_clear_ft_state_req_ft),
-		.service_hold_i(service_hold_ft),
-		.ft_idle_i(status_issue_window),
-		.status_req_i(status_req),
-		.status_pop_i(fifo_pop && status_source_sel && !status_source_change),
-		.status_send_i(status_source_sel && !fsm_wr_o),
+		.clear_i(ft_state_clear_req_ft),
+		.hold_i(service_hold_ft),
+		.issue_ready_i(status_issue_window),
+		.req_i(status_req),
+		.m_ready_i(status_axis_tready),
+		.send_fire_i(status_source_sel && !fsm_wr_o),
 		.loopback_mode_i(loopback_mode_ft),
-		.tx_error_i(tx_fifo_error_i),
-		.rx_error_i(rx_fifo_error_i),
-		.tx_fifo_empty_i(empty_fifo),
+		.tx_error_i(tx_error),
+		.rx_error_i(rx_error),
+		.tx_fifo_empty_i(normal_fifo_empty),
 		.tx_fifo_full_i(tx_fifo_full_ft),
-		.loopback_fifo_empty_i(empty_loopback_fifo),
-		.loopback_fifo_full_i(full_loopback_fifo),
-		.source_sel_o(status_source_sel),
-		.source_empty_o(status_source_empty),
-		.status_word_o(status_word),
-		.source_change_o(status_source_change)
+		.loopback_fifo_empty_i(loop_fifo_empty),
+		.loopback_fifo_full_i(loop_fifo_full),
+		.m_active_o(status_source_sel),
+		.m_empty_o(status_source_empty),
+		.m_data_o(status_word)
 	);
 
 	// GPIO I/O wrapper
-	get_gpio gpio(
+	gpio_wrapper gpio_wrapper(
 		.clk_i(GPIO_CLK),
 		.strob_i(GPIO_STROB),
 		.data_i(GPIO_DATA),
@@ -302,32 +357,28 @@ module top #(
 		.data_o(packer_data_o)
 	);
 	
-	// GPIO-domain asynchronous FIFO
-	fifo_dualport #(
+	// Normal mode asynchronous FIFO
+	async_fifo #(
 		.DATA_LEN(DATA_LEN),
-		.DEPTH(FIFO_DEPTH),
-		.USE_UNDERFLOW(0)
-	) fifo_tx(
+		.DEPTH(FIFO_DEPTH)
+	) async_fifo(
 		.clk_wr(gpio_clk),
 		.clk_rd(ft_clk_i),
 		.rst_wr_n(gpio_rst_n_i),
 		.rst_rd_n(ft_rst_n_i),
-		.soft_clear_wr_i(soft_clear_tx_gpio),
-		.soft_clear_rd_i(soft_clear_tx_ft),
+		.clear_wr_i(tx_fifo_clear_gpio),
+		.clear_rd_i(tx_fifo_clear_ft),
 		.wen_i(packer_wen_i),
-		.ren_i(fifo_tx_pop_i), 
+		.ren_i(normal_fifo_ren),
 		.sram_data_r(sram_out),
-		.data_i(fifo_data_i),
-		.data_o(fifo_data_o),
+		.data_i(normal_fifo_wdata),
+		.data_o(normal_fifo_rdata),
 		.sram_data_w(sram_in),
-		.wen_o(fifo_wen_o),
-		.ren_o(fifo_ren_o),
-		.wr_addr_o(fifo_addr_wr),
-		.rd_addr_o(fifo_addr_rd),
-		.full(full_fifo),
-		.empty(empty_fifo),
-		.overflow(tx_fifo_overflow),
-		.underflow(tx_fifo_underflow)
+		.wen_o(normal_fifo_wen),
+		.wr_addr_o(normal_fifo_waddr),
+		.rd_addr_o(normal_fifo_raddr),
+		.full(normal_fifo_full),
+		.empty(normal_fifo_empty)
 	);
 	
 	// Asynchronous FIFO SRAM
@@ -337,54 +388,52 @@ module top #(
 	) mem_tx(
 		.wr_clk(gpio_clk),
 		.rd_clk(ft_clk_i),
-		.wen(fifo_wen_o),
-		.ren(fifo_ren_o),
-		.wr_addr(fifo_addr_wr),
-		.rd_addr(fifo_addr_rd),
+		.wen(normal_fifo_wen),
+		.wr_addr(normal_fifo_waddr),
+		.rd_addr(normal_fifo_raddr),
 		.data_i(sram_in),
 		.data_o(sram_out)
 	);
 
-	// FT-domain loopback FIFO
-	fifo_singleclock #(
+	// Loopback mode FIFO
+	loopback_fifo #(
 		.DATA_LEN(FIFO_RX_LEN),
 		.DEPTH(FIFO_DEPTH)
 	) loopback_fifo(
 		.clk(ft_clk_i),
 		.rst_n(ft_rst_n_i),
-		.soft_clear_i(soft_clear_rx_req_ft),
-		.wen_i(loopback_fifo_wen_i),
-		.ren_i(fifo_pop && loopback_mode_ft && !status_source_sel),
-		.data_i(loopback_fifo_data_i),
-		.data_o(loopback_fifo_data_o),
-		.full(full_loopback_fifo),
-		.empty(empty_loopback_fifo),
-		.overflow(rx_fifo_overflow),
-		.underflow(rx_fifo_underflow)
+		.clear_i(rx_recovery_clear_req_ft),
+		.wen_i(loop_fifo_wen),
+		.ren_i(loopback_axis_tready),
+		.data_i(loop_fifo_wdata),
+		.data_o(loop_fifo_rdata),
+		.full(loop_fifo_full),
+		.empty(loop_fifo_empty)
 	);
 
-	// Host command control
-	host_cmd_ctrl #(
+	// PC command decoder
+	service_cmd_decoder #(
 		.DATA_LEN(DATA_LEN),
 		.BE_LEN(BE_LEN),
 		.FIFO_RX_LEN(FIFO_RX_LEN)
-	) host_cmd(
+	) service_cmd_decoder(
 		.clk(ft_clk_i),
 		.rst_n(ft_rst_n_i),
-		.rx_word_valid_i(ft_rx_word_valid),
-		.rx_word_i(ft_rx_word),
-		.ft_idle_i(fsm_idle_o),
-		.tx_fifo_underflow_i(tx_fifo_underflow),
-		.tx_fifo_error_i(tx_fifo_error_wr_ft),
-		.rx_fifo_overflow_i(rx_fifo_overflow),
-		.rx_fifo_underflow_i(rx_fifo_underflow),
-		.tx_fifo_error_o(tx_fifo_error_i),
-		.rx_fifo_error_o(rx_fifo_error_i),
-		.soft_clear_tx_o(soft_clear_tx_req_ft),
-		.soft_clear_rx_o(soft_clear_rx_req_ft),
-		.soft_clear_ft_state_o(soft_clear_ft_state_req_ft),
+		.s_valid_i(rx_axis_tvalid && rx_axis_tready),
+		.s_word_i({rx_axis_tkeep, rx_axis_tdata}),
+		.idle_i(fsm_idle_o),
+		.normal_rd_underflow_i(tx_fifo_rd_underflow_event),
+		.normal_wr_error_i(tx_fifo_error_wr_ft),
+		.loopback_wr_overflow_i(loopback_wr_overflow_event),
+		.loopback_rd_underflow_i(loopback_rd_underflow_event),
+		.tx_error_o(tx_error),
+		.rx_error_o(rx_error),
+		.tx_fifo_clear_o(tx_recovery_clear_req_ft),
+		.loopback_fifo_clear_o(rx_recovery_clear_req_ft),
+		.state_clear_o(ft_state_clear_req_ft),
+		.tx_flush_o(tx_prefetch_flush_req_ft),
 		.status_req_o(status_req),
-		.service_hold_o(service_hold_ft),
+		.hold_o(service_hold_ft),
 		.loopback_mode_o(loopback_mode_ft)
 	);
 
@@ -392,44 +441,44 @@ module top #(
 	tx_write_guard tx_guard(
 		.clk(gpio_clk),
 		.rst_n(gpio_rst_n_i),
-		.soft_clear_i(soft_clear_tx_gpio),
+		.clear_i(tx_fifo_clear_gpio),
+		.write_enable_i(!loopback_mode_gpio && !service_hold_gpio),
 		.packer_valid_i(packer_valid_o),
-		.full_fifo_i(full_fifo),
-		.tx_fifo_overflow_i(tx_fifo_overflow),
-		.tx_fifo_error_i(tx_fifo_error_i),
-		.rx_fifo_error_i(rx_fifo_error_i),
-		.packer_wen_o(packer_wen_raw),
+		.full_fifo_i(normal_fifo_full),
+		.tx_fifo_error_i(tx_error),
+		.rx_fifo_error_i(rx_error),
+		.packer_wen_o(packer_wen_i),
 		.tx_fifo_error_wr_o(tx_fifo_error_wr_gpio)
 	);
 
 	// FT-domain FSM 
-	fifo_fsm fsm(
+	ft601_fsm ft601_fsm(
 		.rst_n(ft_rst_n_i),
 		.clk(ft_clk_i),
 		.txe_n(ft_txe_n_i),
 		.rxf_n(ft_rxf_n_i),
-		.data_i(fsm_tx_fifo_data_i),
-		.tx_be_i(fsm_tx_fifo_be_i),
-		.rx_data(rx_data),
-		.be_i(rx_be),
-		.full_fifo(fsm_rx_full_i),
-		.empty_fifo(fsm_tx_fifo_empty_i),
-		.tx_clear_i(tx_source_change || status_source_change),
-		.soft_clear_i(soft_clear_ft_state_req_ft),
+		.tx_axis_tvalid_i(tx_axis_tvalid),
+		.tx_axis_tready_o(tx_axis_tready),
+		.tx_axis_tdata_i(tx_axis_tdata),
+		.tx_axis_tkeep_i(tx_axis_tkeep),
+		.rx_axis_tvalid_o(ft_rx_axis_tvalid),
+		.rx_axis_tready_i(ft_rx_axis_tready),
+		.rx_axis_tdata_o(ft_rx_axis_tdata),
+		.rx_axis_tkeep_o(ft_rx_axis_tkeep),
+		.rx_data_i(rx_data),
+		.rx_keep_i(rx_be),
+		.tx_flush_i(tx_source_change || tx_prefetch_flush_req_ft),
+		.state_clear_i(ft_state_clear_req_ft),
 		.service_hold_i(service_hold_ft),
 		.tx_prefetch_en_i(tx_prefetch_en),
-		.data_o(fsm_data_o),
-		.tx_data(tx_data),
-		.be_o(tx_be),
-		.fifo_be(fsm_be_o),
+		.tx_source_status_i(status_source_sel),
+		.tx_data_o(tx_data),
+		.tx_keep_o(tx_be),
 		.wr_n(fsm_wr_o),
 		.rd_n(fsm_rd_o),
 		.oe_n(fsm_oe_o),
 		.drive_tx(drive_tx),
-		.idle_o(fsm_idle_o),
-		.tx_path_idle_o(fsm_tx_path_idle_o),
-		.fifo_pop(fifo_pop),
-		.fifo_append(fifo_append)
+		.idle_o(fsm_idle_o)
 	);
 	
 endmodule

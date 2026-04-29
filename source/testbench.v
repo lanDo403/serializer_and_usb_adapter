@@ -1,4 +1,21 @@
 `timescale 1ns / 1ps
+`include "axis_tx_arbiter.v"
+`include "bit_sync.v"
+`include "async_fifo.v"
+`include "ft601_rx_adapter.v"
+`include "ft601_tx_adapter.v"
+`include "ft601_fsm.v"
+`include "loopback_fifo.v"
+`include "ft601_wrapper.v"
+`include "gpio_wrapper.v"
+`include "service_cmd_decoder.v"
+`include "rx_stream_router.v"
+`include "packer8to32.v"
+`include "pulse_sync.v"
+`include "rst_sync.v"
+`include "sram_dualport.v"
+`include "status_source.v"
+`include "tx_write_guard.v"
 `include "top.v"
 
 /* verilator lint_off DECLFILENAME */
@@ -55,14 +72,21 @@ module testbench;
    localparam [DATA_LEN-1:0] CMD_SET_LOOPBACK = 32'hA5A50004;
    localparam [DATA_LEN-1:0] CMD_SET_NORMAL = 32'hA5A50005;
    localparam [DATA_LEN-1:0] CMD_GET_STATUS = 32'hA5A50006;
+   localparam [DATA_LEN-1:0] CMD_RESET_FT_STATE = 32'hA5A50007;
    localparam [DATA_LEN-1:0] CMD_UNKNOWN = 32'hDEADBEEF;
    localparam [BE_LEN-1:0]   FULL_BE = {BE_LEN{1'b1}};
+   localparam integer        TX_BACKPRESSURE_GUARD_WORDS = 16;
+   localparam integer        TX_CAPTURE_WORDS_MAX = 16;
+   localparam                TB_VERBOSE_STREAM = 1'b0;
+   localparam                TB_VERBOSE_LATENCY = 1'b0;
+   localparam                TB_VERBOSE_COMMAND = 1'b0;
+   localparam integer        TB_POSEDGE_SAMPLE_DELAY = 2;
 
    reg                  gpio_clk;
    reg                  ft_clk;
    reg                  gpio_strob;
    reg                  fpga_reset;
-   reg                  ft_reset_n;
+   wire                 ft_reset_n;
    reg  [GPIO_LEN-1:0]  gpio_data;
    reg                  ft_txe_n;
    reg                  ft_rxf_n;
@@ -129,16 +153,26 @@ module testbench;
    integer tx_release_cycles_max;
    integer tx_assert_events_n;
    integer tx_release_events_n;
+   integer exp_tx_assert_cycles;
+   integer exp_tx_release_cycles;
+   integer exp_rx_oe_assert_cycles;
+   integer exp_rx_rd_assert_cycles;
+   integer exp_rx_oe_release_cycles;
+   integer exp_rx_rd_release_cycles;
    integer cmd_valid_pulses_n;
    reg     rx_payload_check_en;
+   reg     tx_stream_only_mode;
+   integer tx_total_words_n;
    reg [DATA_LEN-1:0] last_status_header_word;
    reg [DATA_LEN-1:0] last_status_word;
+   reg [DATA_LEN-1:0] tx_captured_words [0:TX_CAPTURE_WORDS_MAX-1];
+   reg [BE_LEN-1:0]   tx_captured_be    [0:TX_CAPTURE_WORDS_MAX-1];
 
    assign ft_data_bus = host_drive_en ? host_data_drv : {DATA_LEN{1'bz}};
    assign ft_be_bus   = host_drive_en ? host_be_drv   : {BE_LEN{1'bz}};
 
    always #10  gpio_clk = ~gpio_clk;   // 50 MHz GPIO clock
-   always #7.5 ft_clk   = ~ft_clk;     // 66.67 MHz FT601 clock
+   always #5   ft_clk   = ~ft_clk;     // 100 MHz FT601 clock
 
    top #(
       .GPIO_LEN(GPIO_LEN),
@@ -165,8 +199,7 @@ module testbench;
       gpio_clk      = 1'b0;
       ft_clk        = 1'b0;
       gpio_strob    = 1'b0;
-      fpga_reset    = 1'b0;
-      ft_reset_n    = 1'b0;
+      fpga_reset    = 1'b1;
       gpio_data     = {GPIO_LEN{1'b0}};
       ft_txe_n      = 1'b1;
       ft_rxf_n      = 1'b1;
@@ -222,10 +255,22 @@ module testbench;
       tx_release_cycles_max = 0;
       tx_assert_events_n = 0;
       tx_release_events_n = 0;
+      exp_tx_assert_cycles = -1;
+      exp_tx_release_cycles = -1;
+      exp_rx_oe_assert_cycles = -1;
+      exp_rx_rd_assert_cycles = -1;
+      exp_rx_oe_release_cycles = -1;
+      exp_rx_rd_release_cycles = -1;
       cmd_valid_pulses_n = 0;
       rx_payload_check_en = 1'b0;
+      tx_stream_only_mode = 1'b0;
+      tx_total_words_n = 0;
       last_status_header_word = {DATA_LEN{1'b0}};
       last_status_word = {DATA_LEN{1'b0}};
+      for (integer cap_i = 0; cap_i < TX_CAPTURE_WORDS_MAX; cap_i = cap_i + 1) begin
+         tx_captured_words[cap_i] = {DATA_LEN{1'b0}};
+         tx_captured_be[cap_i] = {BE_LEN{1'b0}};
+      end
    end
 
    task fail(input [1023:0] msg);
@@ -241,6 +286,8 @@ module testbench;
       integer ft_release_cycles;
       begin
          $display("INFO: Applying reset requests");
+         rx_payload_check_en = 1'b0;
+         tx_stream_only_mode = 1'b1;
          @(negedge gpio_clk);
          gpio_strob    = 1'b0;
          gpio_data     = {GPIO_LEN{1'b0}};
@@ -250,13 +297,14 @@ module testbench;
          host_data_drv = {DATA_LEN{1'b0}};
          host_be_drv   = {BE_LEN{1'b0}};
          fpga_reset    = 1'b1;
-         ft_reset_n    = 1'b0;
 
          #1;
+         if (ft_reset_n !== 1'b0)
+            fail("RESET_N output must assert low while FPGA_RESET is active");
          if (dut.gpio_rst_n_i !== 1'b0)
             fail("gpio_rst_n_i must assert low immediately after FPGA_RESET");
          if (dut.ft_rst_n_i !== 1'b0)
-            fail("ft_rst_n_i must assert low immediately after RESET_N goes low");
+            fail("ft_rst_n_i must assert low immediately after FPGA_RESET");
 
          for (n = 0; n < 4; n = n + 1)
             @(posedge gpio_clk);
@@ -274,9 +322,10 @@ module testbench;
 
          $display("INFO: Releasing reset requests");
          fpga_reset = 1'b0;
-         ft_reset_n = 1'b1;
 
          #1;
+         if (ft_reset_n !== 1'b1)
+            fail("RESET_N output must release high after FPGA_RESET is inactive");
          if (dut.gpio_rst_n_i !== 1'b0)
             fail("gpio_rst_n_i must remain low until synchronized release");
          if (dut.ft_rst_n_i !== 1'b0)
@@ -401,9 +450,11 @@ module testbench;
    endtask
 
    task clear_monitors;
+      integer cap_i;
       begin
          tx_words_n = 0;
          tx_status_words_n = 0;
+         tx_total_words_n = 0;
          rx_words_n = 0;
          rx_active_cycles_n = 0;
          oe_active_cycles_n = 0;
@@ -450,10 +501,113 @@ module testbench;
          tx_release_cycles_max = 0;
          tx_assert_events_n = 0;
          tx_release_events_n = 0;
+         exp_tx_assert_cycles = -1;
+         exp_tx_release_cycles = -1;
+         exp_rx_oe_assert_cycles = -1;
+         exp_rx_rd_assert_cycles = -1;
+         exp_rx_oe_release_cycles = -1;
+         exp_rx_rd_release_cycles = -1;
          cmd_valid_pulses_n = 0;
          rx_payload_check_en = 1'b0;
+         tx_stream_only_mode = 1'b0;
          last_status_header_word = {DATA_LEN{1'b0}};
          last_status_word = {DATA_LEN{1'b0}};
+         for (cap_i = 0; cap_i < TX_CAPTURE_WORDS_MAX; cap_i = cap_i + 1) begin
+            tx_captured_words[cap_i] = {DATA_LEN{1'b0}};
+            tx_captured_be[cap_i] = {BE_LEN{1'b0}};
+         end
+      end
+   endtask
+
+   task scenario_start(input [1023:0] name);
+      begin
+         $display("INFO: SCENARIO START [%0d ns] %0s", $time, name);
+      end
+   endtask
+
+   task scenario_end(input [1023:0] name);
+      begin
+         $display("INFO: SCENARIO END   [%0d ns] %0s", $time, name);
+      end
+   endtask
+
+   task set_tx_latency_expectations(
+      input integer assert_cycles,
+      input integer release_cycles
+   );
+      begin
+         exp_tx_assert_cycles = assert_cycles;
+         exp_tx_release_cycles = release_cycles;
+      end
+   endtask
+
+   task set_rx_latency_expectations(
+      input integer oe_assert_cycles,
+      input integer rd_assert_cycles,
+      input integer oe_release_cycles,
+      input integer rd_release_cycles
+   );
+      begin
+         exp_rx_oe_assert_cycles = oe_assert_cycles;
+         exp_rx_rd_assert_cycles = rd_assert_cycles;
+         exp_rx_oe_release_cycles = oe_release_cycles;
+         exp_rx_rd_release_cycles = rd_release_cycles;
+      end
+   endtask
+
+   task check_payload_tx_latency(
+      input [1023:0] context_name
+   );
+      begin
+         if (tx_assert_events_n == 0)
+            fail("TX assert latency was never measured");
+         if (tx_release_events_n == 0)
+            fail("TX release latency was never measured");
+         if ((exp_tx_assert_cycles >= 0) && (tx_assert_cycles_max !== exp_tx_assert_cycles)) begin
+            $display("ERROR: %0s TX assert latency max got=%0d expected=%0d",
+                     context_name, tx_assert_cycles_max, exp_tx_assert_cycles);
+            $finish;
+         end
+         if ((exp_tx_release_cycles >= 0) && (tx_release_cycles_max !== exp_tx_release_cycles)) begin
+            $display("ERROR: %0s TX release latency max got=%0d expected=%0d",
+                     context_name, tx_release_cycles_max, exp_tx_release_cycles);
+            $finish;
+         end
+      end
+   endtask
+
+   task check_payload_rx_latency(
+      input [1023:0] context_name
+   );
+      begin
+         if (rx_oe_assert_events_n == 0)
+            fail("RX OE_N assert latency was never measured");
+         if (rx_rd_assert_events_n == 0)
+            fail("RX RD_N assert latency was never measured");
+         if (rx_oe_release_events_n == 0)
+            fail("RX OE_N release latency was never measured");
+         if (rx_rd_release_events_n == 0)
+            fail("RX RD_N release latency was never measured");
+         if ((exp_rx_oe_assert_cycles >= 0) && (rx_oe_assert_cycles_max !== exp_rx_oe_assert_cycles)) begin
+            $display("ERROR: %0s RX OE assert latency max got=%0d expected=%0d",
+                     context_name, rx_oe_assert_cycles_max, exp_rx_oe_assert_cycles);
+            $finish;
+         end
+         if ((exp_rx_rd_assert_cycles >= 0) && (rx_rd_assert_cycles_max !== exp_rx_rd_assert_cycles)) begin
+            $display("ERROR: %0s RX RD assert latency max got=%0d expected=%0d",
+                     context_name, rx_rd_assert_cycles_max, exp_rx_rd_assert_cycles);
+            $finish;
+         end
+         if ((exp_rx_oe_release_cycles >= 0) && (rx_oe_release_cycles_max !== exp_rx_oe_release_cycles)) begin
+            $display("ERROR: %0s RX OE release latency max got=%0d expected=%0d",
+                     context_name, rx_oe_release_cycles_max, exp_rx_oe_release_cycles);
+            $finish;
+         end
+         if ((exp_rx_rd_release_cycles >= 0) && (rx_rd_release_cycles_max !== exp_rx_rd_release_cycles)) begin
+            $display("ERROR: %0s RX RD release latency max got=%0d expected=%0d",
+                     context_name, rx_rd_release_cycles_max, exp_rx_rd_release_cycles);
+            $finish;
+         end
       end
    endtask
 
@@ -555,33 +709,33 @@ module testbench;
       end
    endtask
 
-   task pulse_soft_clear_tx_req_ft;
+   task pulse_tx_recovery_clear_req_ft;
       begin
          @(negedge ft_clk);
-         force dut.soft_clear_tx_req_ft = 1'b1;
+         force dut.tx_recovery_clear_req_ft = 1'b1;
          @(posedge ft_clk);
          #1;
-         release dut.soft_clear_tx_req_ft;
+         release dut.tx_recovery_clear_req_ft;
       end
    endtask
 
-   task pulse_soft_clear_rx_req_ft;
+   task pulse_rx_recovery_clear_req_ft;
       begin
          @(negedge ft_clk);
-         force dut.soft_clear_rx_req_ft = 1'b1;
+         force dut.rx_recovery_clear_req_ft = 1'b1;
          @(posedge ft_clk);
          #1;
-         release dut.soft_clear_rx_req_ft;
+         release dut.rx_recovery_clear_req_ft;
       end
    endtask
 
-   task pulse_soft_clear_ft_state_req_ft;
+   task pulse_ft_state_clear_req_ft;
       begin
          @(negedge ft_clk);
-         force dut.soft_clear_ft_state_req_ft = 1'b1;
+         force dut.ft_state_clear_req_ft = 1'b1;
          @(posedge ft_clk);
          #1;
-         release dut.soft_clear_ft_state_req_ft;
+         release dut.ft_state_clear_req_ft;
       end
    endtask
 
@@ -589,13 +743,28 @@ module testbench;
       integer timeout;
       begin
          timeout = 0;
-         while ((((ft_rd_n !== 1'b1) || (ft_oe_n !== 1'b1)) || (dut.fsm.state !== 5'b00001)) && (timeout < 64)) begin
+         while ((((ft_rd_n !== 1'b1) || (ft_oe_n !== 1'b1)) || (dut.ft601_fsm.state !== 5'b00001)) && (timeout < 64)) begin
             @(posedge ft_clk);
             timeout = timeout + 1;
          end
 
-         if ((ft_rd_n !== 1'b1) || (ft_oe_n !== 1'b1) || (dut.fsm.state !== 5'b00001))
+         if ((ft_rd_n !== 1'b1) || (ft_oe_n !== 1'b1) || (dut.ft601_fsm.state !== 5'b00001))
             fail("FT601 RX path did not return to ARB/idle");
+      end
+   endtask
+
+   task wait_for_ft_tx_idle;
+      integer timeout;
+      begin
+         timeout = 0;
+         while (((ft_wr_n !== 1'b1) || (dut.ft601_fsm.state !== 5'b00001)) && (timeout < 64)) begin
+            @(posedge ft_clk);
+            #TB_POSEDGE_SAMPLE_DELAY;
+            timeout = timeout + 1;
+         end
+
+         if ((ft_wr_n !== 1'b1) || (dut.ft601_fsm.state !== 5'b00001))
+            fail("FT601 TX path did not return to ARB/idle");
       end
    endtask
 
@@ -705,16 +874,6 @@ module testbench;
 
          if (tx_words_n !== expected_words) begin
             $display("ERROR: TX timeout, got=%0d expected=%0d", tx_words_n, expected_words);
-            $display("DEBUG: empty_fifo=%b full_fifo=%b packer_valid_o=%b packer_wen_raw=%b packer_wen_i=%b",
-                     dut.empty_fifo, dut.full_fifo, dut.packer_valid_o, dut.packer_wen_raw, dut.packer_wen_i);
-            $display("DEBUG: tx_fifo_error_i=%b rx_fifo_error_i=%b loopback_mode_ft=%b loopback_mode_gpio=%b",
-                     dut.tx_fifo_error_i, dut.rx_fifo_error_i, dut.loopback_mode_ft, dut.loopback_mode_gpio);
-            $display("DEBUG: tx_guard local/sync tx=%b/%b rx_sync=%b",
-                     dut.tx_guard.tx_fifo_error_wr_ff, dut.tx_guard.tx_fifo_error_sync2_ff, dut.tx_guard.rx_fifo_error_sync2_ff);
-            $display("DEBUG: fifo_tx wr_ptr=%0d rd_ptr=%0d wr_gray_sync2=%0d rd_gray_sync2=%0d",
-                     dut.fifo_tx.wr_ptr_bin, dut.fifo_tx.rd_ptr_bin, dut.fifo_tx.wr_ptr_gray_sync2, dut.fifo_tx.rd_ptr_gray_sync2);
-            $display("DEBUG: fsm state=%b tx_data_valid=%b tx_prefetch_valid=%b tx_prefetch_pending=%b fifo_pop=%b",
-                     dut.fsm.state, dut.fsm.tx_data_valid_ff, dut.fsm.tx_prefetch_valid_ff, dut.fsm.tx_prefetch_pending_ff, dut.fifo_pop);
             $finish;
          end
       end
@@ -760,12 +919,63 @@ module testbench;
       end
    endtask
 
+   task wait_for_tx_total_words(
+      input integer expected_words,
+      input integer timeout_cycles
+   );
+      integer i;
+      begin
+         for (i = 0; i < timeout_cycles; i = i + 1) begin
+            if (tx_total_words_n == expected_words)
+               i = timeout_cycles;
+            else
+               @(negedge ft_clk);
+         end
+
+         if (tx_total_words_n !== expected_words) begin
+            $display("ERROR: TX total-word timeout, got=%0d expected=%0d", tx_total_words_n, expected_words);
+            $finish;
+         end
+      end
+   endtask
+
+   task expect_captured_tx_word(
+      input integer        wi,
+      input [DATA_LEN-1:0] expected_data,
+      input [BE_LEN-1:0]   expected_be
+   );
+      begin
+         if (wi >= tx_total_words_n)
+            fail("captured TX stream is shorter than expected");
+         if (wi >= TX_CAPTURE_WORDS_MAX)
+            fail("captured TX stream index exceeds TX_CAPTURE_WORDS_MAX");
+         if (tx_captured_words[wi] !== expected_data) begin
+            $display("ERROR: TX captured word [%0d] got=%h expected=%h", wi, tx_captured_words[wi], expected_data);
+            $finish;
+         end
+         if (tx_captured_be[wi] !== expected_be) begin
+            $display("ERROR: TX captured BE [%0d] got=%h expected=%h", wi, tx_captured_be[wi], expected_be);
+            $finish;
+         end
+      end
+   endtask
+
+   task expect_status_frame_at(
+      input integer        first_word_index,
+      input [DATA_LEN-1:0] expected_status_word
+   );
+      begin
+         expect_captured_tx_word(first_word_index, STATUS_MAGIC, FULL_BE);
+         expect_captured_tx_word(first_word_index + 1, expected_status_word, FULL_BE);
+      end
+   endtask
+
    task expect_no_tx_for_cycles(input integer cycles);
       integer start_words;
       begin
-         start_words = tx_words_n + tx_status_words_n;
+         start_words = tx_total_words_n;
          wait_ft_cycles(cycles);
-         if ((tx_words_n + tx_status_words_n) !== start_words)
+         if (tx_total_words_n !== start_words)
             fail("FT601 transmitted data while TXE_N was inactive");
       end
    endtask
@@ -775,20 +985,59 @@ module testbench;
       input integer stall_cycles
    );
       integer i;
+      integer timeout;
+      integer words_before_stall;
       begin
          while (tx_words_n < after_words)
             @(negedge ft_clk);
 
+         timeout = 0;
+         while ((((ft_wr_n !== 1'b0) || (dut.ft601_fsm.tx_adapter.word_valid_ff !== 1'b1)) ||
+                 ((exp_words_n - tx_words_n) <= TX_BACKPRESSURE_GUARD_WORDS)) &&
+                (timeout < 256)) begin
+            @(negedge ft_clk);
+            timeout = timeout + 1;
+         end
+
+         if (ft_wr_n !== 1'b0)
+            fail("backpressure injection must start during an active TX burst");
+         if (dut.ft601_fsm.tx_adapter.word_valid_ff !== 1'b1)
+            fail("backpressure injection requires tx_data_valid_ff=1");
+         if ((exp_words_n - tx_words_n) <= TX_BACKPRESSURE_GUARD_WORDS)
+            fail("backpressure injection started too late, not enough payload words remain");
+
          @(posedge ft_clk);
          ft_set_txe_now(1'b1);
-         $display("INFO: TXE_N deasserted high to emulate FT601 backpressure");
+         $display("INFO: TXE_N deasserted high to emulate FT601 backpressure, tx_words=%0d remaining=%0d",
+                  tx_words_n, exp_words_n - tx_words_n);
+
+         timeout = 0;
+         while ((ft_wr_n !== 1'b1) && (timeout < 8)) begin
+            @(negedge ft_clk);
+            timeout = timeout + 1;
+         end
+         if (ft_wr_n !== 1'b1)
+            fail("WR_N did not release after TXE_N backpressure");
+
+         words_before_stall = tx_words_n;
 
          for (i = 0; i < stall_cycles; i = i + 1)
             @(negedge ft_clk);
 
+         if (tx_words_n !== words_before_stall)
+            fail("TX payload advanced while TXE_N was high");
+
          @(posedge ft_clk);
          ft_set_txe_now(1'b0);
          $display("INFO: TXE_N asserted low again, FT601 accepts TX data");
+
+         timeout = 0;
+         while ((ft_wr_n !== 1'b0) && (timeout < 16)) begin
+            @(negedge ft_clk);
+            timeout = timeout + 1;
+         end
+         if (ft_wr_n !== 1'b0)
+            fail("WR_N did not resume after TXE_N returned low");
       end
    endtask
 
@@ -810,19 +1059,51 @@ module testbench;
                fail("FT601 RX burst did not start");
          end
 
-         if (exp_words_n == 1)
-            ft_drive_rx_now(exp_words[0], {BE_LEN{1'b1}}, 1'b1, 1'b1);
-         else
+         if (exp_words_n > 1)
             ft_drive_rx_now(exp_words[1], {BE_LEN{1'b1}}, 1'b1, 1'b0);
 
          for (i = 1; i + 1 < exp_words_n; i = i + 1) begin
             @(posedge ft_clk);
             if ((ft_rd_n !== 1'b0) || (ft_oe_n !== 1'b0))
                fail("RX burst has an unexpected gap");
-            if (i + 2 == exp_words_n)
-               ft_drive_rx_now(exp_words[i + 1], {BE_LEN{1'b1}}, 1'b1, 1'b1);
-            else
-               ft_drive_rx_now(exp_words[i + 1], {BE_LEN{1'b1}}, 1'b1, 1'b0);
+            ft_drive_rx_now(exp_words[i + 1], {BE_LEN{1'b1}}, 1'b1, 1'b0);
+         end
+
+         @(posedge ft_clk);
+         ft_drive_rx_now({DATA_LEN{1'b0}}, {BE_LEN{1'b0}}, 1'b0, 1'b1);
+      end
+   endtask
+
+   task drive_first_expected_loopback_words(
+      input integer count
+   );
+      integer i;
+      integer timeout;
+      begin
+         if (count <= 0)
+            fail("loopback burst helper requires a positive word count");
+         if (count > exp_words_n)
+            fail("loopback burst helper count exceeds expected stimulus size");
+
+         @(posedge ft_clk);
+         ft_drive_rx_now(exp_words[0], FULL_BE, 1'b1, 1'b0);
+
+         timeout = 0;
+         while ((ft_rd_n !== 1'b0) || (ft_oe_n !== 1'b0)) begin
+            @(negedge ft_clk);
+            timeout = timeout + 1;
+            if (timeout > 64)
+               fail("short FT601 RX burst did not start");
+         end
+
+         if (count > 1)
+            ft_drive_rx_now(exp_words[1], FULL_BE, 1'b1, 1'b0);
+
+         for (i = 1; i + 1 < count; i = i + 1) begin
+            @(posedge ft_clk);
+            if ((ft_rd_n !== 1'b0) || (ft_oe_n !== 1'b0))
+               fail("short RX burst has an unexpected gap");
+            ft_drive_rx_now(exp_words[i + 1], FULL_BE, 1'b1, 1'b0);
          end
 
          @(posedge ft_clk);
@@ -835,7 +1116,8 @@ module testbench;
    );
       integer timeout;
       begin
-         $display("INFO: Sending FT601 command frame magic=%h opcode=%h", CMD_MAGIC, cmd_word);
+         if (TB_VERBOSE_COMMAND)
+            $display("INFO: Sending FT601 command frame magic=%h opcode=%h", CMD_MAGIC, cmd_word);
 
          @(posedge ft_clk);
          ft_drive_rx_now(CMD_MAGIC, FULL_BE, 1'b1, 1'b0);
@@ -848,7 +1130,11 @@ module testbench;
                fail("FT601 command frame RX transaction did not start");
          end
 
-         ft_drive_rx_now(cmd_word, FULL_BE, 1'b1, 1'b1);
+         ft_drive_rx_now(cmd_word, FULL_BE, 1'b1, 1'b0);
+
+         @(posedge ft_clk);
+         @(posedge ft_clk);
+         ft_drive_rx_now({DATA_LEN{1'b0}}, {BE_LEN{1'b0}}, 1'b0, 1'b1);
 
          timeout = 0;
          while ((ft_rd_n !== 1'b1) || (ft_oe_n !== 1'b1)) begin
@@ -861,6 +1147,7 @@ module testbench;
          @(posedge ft_clk);
          wait_for_ft_rx_idle();
          ft_drive_rx_now({DATA_LEN{1'b0}}, {BE_LEN{1'b0}}, 1'b0, 1'b1);
+         wait_ft_cycles(3);
       end
    endtask
 
@@ -942,6 +1229,8 @@ module testbench;
       integer ft_release_cycles;
       begin
          $display("INFO: Pulsing FPGA_RESET to exit loopback mode");
+         rx_payload_check_en = 1'b0;
+         tx_stream_only_mode = 1'b1;
 
          @(negedge gpio_clk);
          gpio_strob    = 1'b0;
@@ -953,12 +1242,20 @@ module testbench;
          host_be_drv   = {BE_LEN{1'b0}};
          fpga_reset    = 1'b1;
 
+         #1;
+         if (ft_reset_n !== 1'b0)
+            fail("RESET_N output must assert low while FPGA_RESET is active");
+
          for (n = 0; n < 4; n = n + 1)
             @(posedge gpio_clk);
          for (n = 0; n < 4; n = n + 1)
             @(posedge ft_clk);
 
          fpga_reset = 1'b0;
+
+         #1;
+         if (ft_reset_n !== 1'b1)
+            fail("RESET_N output must release high after FPGA_RESET");
 
          gpio_release_cycles = 0;
          while ((dut.gpio_rst_n_i !== 1'b1) && (gpio_release_cycles < 4)) begin
@@ -988,6 +1285,95 @@ module testbench;
       end
    endtask
 
+   task test_fpga_reset_drives_ft601_reset;
+      integer n;
+      integer gpio_release_cycles;
+      integer ft_release_cycles;
+      begin
+         $display("INFO: Checking FPGA_RESET drives FT601 RESET_N and resets both domains");
+         rx_payload_check_en = 1'b0;
+         tx_stream_only_mode = 1'b1;
+
+         @(negedge gpio_clk);
+         gpio_strob    = 1'b0;
+         gpio_data     = {GPIO_LEN{1'b0}};
+         ft_txe_n      = 1'b1;
+         ft_rxf_n      = 1'b1;
+         host_drive_en = 1'b0;
+         host_data_drv = {DATA_LEN{1'b0}};
+         host_be_drv   = {BE_LEN{1'b0}};
+         fpga_reset    = 1'b1;
+
+         #1;
+         if (ft_reset_n !== 1'b0)
+            fail("RESET_N output must assert low during FPGA_RESET");
+         if (dut.ft_rst_n_i !== 1'b0)
+            fail("ft_rst_n_i must assert low immediately after FPGA_RESET");
+         if (dut.gpio_rst_n_i !== 1'b0)
+            fail("gpio_rst_n_i must assert low during FPGA_RESET");
+         if (ft_wr_n !== 1'b1)
+            fail("WR_N must stay inactive during FPGA_RESET");
+         if (ft_rd_n !== 1'b1)
+            fail("RD_N must stay inactive during FPGA_RESET");
+         if (ft_oe_n !== 1'b1)
+            fail("OE_N must stay inactive during FPGA_RESET");
+         if (ft_data_bus !== {DATA_LEN{1'bz}})
+            fail("DATA bus must be tri-stated during FPGA_RESET");
+         if (ft_be_bus !== {BE_LEN{1'bz}})
+            fail("BE bus must be tri-stated during FPGA_RESET");
+
+         for (n = 0; n < 4; n = n + 1)
+            @(posedge gpio_clk);
+         for (n = 0; n < 4; n = n + 1)
+            @(posedge ft_clk);
+
+         if (dut.drive_tx !== 1'b0)
+            fail("drive_tx must clear during FPGA_RESET");
+
+         fpga_reset = 1'b0;
+
+         #1;
+         if (ft_reset_n !== 1'b1)
+            fail("RESET_N output must release high after FPGA_RESET");
+         if (dut.gpio_rst_n_i !== 1'b0)
+            fail("gpio_rst_n_i must remain low until synchronized FPGA_RESET release");
+         if (dut.ft_rst_n_i !== 1'b0)
+            fail("ft_rst_n_i must remain low until synchronized FPGA_RESET release");
+
+         gpio_release_cycles = 0;
+         while ((dut.gpio_rst_n_i !== 1'b1) && (gpio_release_cycles < 4)) begin
+            @(posedge gpio_clk);
+            gpio_release_cycles = gpio_release_cycles + 1;
+         end
+         if (dut.gpio_rst_n_i !== 1'b1)
+            fail("gpio_rst_n_i did not release after FPGA_RESET pulse");
+
+         ft_release_cycles = 0;
+         while ((dut.ft_rst_n_i !== 1'b1) && (ft_release_cycles < 4)) begin
+            @(posedge ft_clk);
+            ft_release_cycles = ft_release_cycles + 1;
+         end
+         if (dut.ft_rst_n_i !== 1'b1)
+            fail("ft_rst_n_i did not release after FPGA_RESET pulse");
+
+         wait_gpio_cycles(4);
+         wait_ft_cycles(4);
+
+         if (dut.loopback_mode_ft !== 1'b0)
+            fail("loopback_mode_ft must return to 0 after FPGA_RESET");
+         if (dut.loopback_mode_gpio !== 1'b0)
+            fail("loopback mode must clear in GPIO domain after FPGA_RESET");
+         if (ft_wr_n !== 1'b1)
+            fail("WR_N must stay inactive after FPGA_RESET release");
+         if (ft_rd_n !== 1'b1)
+            fail("RD_N must stay inactive after FPGA_RESET release");
+         if (ft_oe_n !== 1'b1)
+            fail("OE_N must stay inactive after FPGA_RESET release");
+
+         $display("INFO: FPGA_RESET drove RESET_N and returned the design to normal mode");
+      end
+   endtask
+
    task test_gpio_mode;
       begin
          if (dut.loopback_mode_ft !== 1'b0)
@@ -1013,157 +1399,137 @@ module testbench;
             fail("RD_N became active in GPIO TX-only mode");
          if (oe_active_cycles_n != 0)
             fail("OE_N became active in GPIO TX-only mode");
-         if (dut.empty_fifo !== 1'b1)
+         if (dut.normal_fifo_empty !== 1'b1)
             fail("TX FIFO is not empty after GPIO-mode transmission");
-         $display("INFO: TX assert latency max=%0d FT clocks, release latency max=%0d FT clocks", tx_assert_cycles_max + 1, tx_release_cycles_max + 1);
-         if (tx_assert_events_n == 0)
-            fail("TX assert latency was never measured in GPIO mode");
-         if (tx_release_events_n == 0)
-            fail("TX release latency was never measured in GPIO mode");
+         check_payload_tx_latency("GPIO mode");
+         $display("INFO: TX assert latency max=%0d FT clocks, release latency max=%0d FT clocks", tx_assert_cycles_max, tx_release_cycles_max);
          $display("INFO: GPIO mode test passed, transmitted %0d words", tx_words_n);
       end
    endtask
 
-   task test_soft_clear_tx_path;
+   task test_tx_recovery_clear_path;
       begin
-         $display("INFO: Checking soft-clear primitive for async TX FIFO and gpio guard");
+         $display("INFO: Checking recovery clear primitive for async TX FIFO and gpio guard");
 
          force dut.tx_prefetch_en = 1'b0;
-         dut.fifo_tx.wr_ptr_bin = 14'd5;
-         dut.fifo_tx.rd_ptr_bin = 14'd3;
-         dut.fifo_tx.wr_ptr_gray = 14'd7;
-         dut.fifo_tx.rd_ptr_gray = 14'd2;
-         dut.fifo_tx.wr_ptr_gray_sync1 = 14'd7;
-         dut.fifo_tx.wr_ptr_gray_sync2 = 14'd7;
-         dut.fifo_tx.rd_ptr_gray_sync1 = 14'd2;
-         dut.fifo_tx.rd_ptr_gray_sync2 = 14'd2;
-         dut.fifo_tx.empty_ff = 1'b0;
-         dut.fifo_tx.full_ff = 1'b1;
-         dut.fifo_tx.overflow_ff = 1'b1;
+         dut.async_fifo.wr_ptr_bin = 14'd5;
+         dut.async_fifo.rd_ptr_bin = 14'd3;
+         dut.async_fifo.wr_ptr_gray = 14'd7;
+         dut.async_fifo.rd_ptr_gray = 14'd2;
+         dut.async_fifo.wr_ptr_gray_sync1 = 14'd7;
+         dut.async_fifo.wr_ptr_gray_sync2 = 14'd7;
+         dut.async_fifo.rd_ptr_gray_sync1 = 14'd2;
+         dut.async_fifo.rd_ptr_gray_sync2 = 14'd2;
+         dut.async_fifo.empty_ff = 1'b0;
+         dut.async_fifo.full_ff = 1'b1;
          dut.tx_guard.tx_fifo_error_wr_ff = 1'b1;
 
-         pulse_soft_clear_tx_req_ft();
+         pulse_tx_recovery_clear_req_ft();
          wait_ft_cycles(12);
          wait_gpio_cycles(12);
+         wait_ft_cycles(8);
 
-         if (dut.empty_fifo !== 1'b1) begin
-            fail("TX soft clear must force empty_fifo high");
+         if (dut.normal_fifo_empty !== 1'b1) begin
+            fail("TX recovery clear must force normal_fifo_empty high");
          end
-         if (dut.full_fifo !== 1'b0)
-            fail("TX soft clear must force full_fifo low");
-         if (dut.tx_fifo_overflow !== 1'b0)
-            fail("TX soft clear must clear TX overflow");
-         if (dut.tx_fifo_underflow !== 1'b0)
-            fail("TX soft clear must clear TX underflow");
+         if (dut.normal_fifo_full !== 1'b0)
+            fail("TX recovery clear must force normal_fifo_full low");
          if (dut.tx_guard.tx_fifo_error_wr_ff !== 1'b0)
-            fail("TX soft clear must clear gpio-domain TX guard sticky state");
-         if (dut.fifo_tx.wr_ptr_bin !== 0)
-            fail("TX soft clear must clear write pointer");
-         if (dut.fifo_tx.rd_ptr_bin !== 0)
-            fail("TX soft clear must clear read pointer");
+            fail("TX recovery clear must clear gpio-domain TX guard sticky state");
+         if (dut.async_fifo.wr_ptr_bin !== 0)
+            fail("TX recovery clear must clear write pointer");
+         if (dut.async_fifo.rd_ptr_bin !== 0)
+            fail("TX recovery clear must clear read pointer");
          release dut.tx_prefetch_en;
       end
    endtask
 
-   task test_soft_clear_rx_path;
+   task test_rx_recovery_clear_path;
       begin
-         $display("INFO: Checking soft-clear primitive for FT-domain loopback FIFO");
+         $display("INFO: Checking recovery clear primitive for FT-domain loopback FIFO");
 
          dut.loopback_fifo.wr_ptr_ff = 14'd4;
          dut.loopback_fifo.rd_ptr_ff = 14'd1;
          dut.loopback_fifo.data_ff = 36'hF55667788;
          dut.loopback_fifo.empty_ff = 1'b0;
          dut.loopback_fifo.full_ff = 1'b1;
-         dut.loopback_fifo.overflow_ff = 1'b1;
-         dut.loopback_fifo.underflow_ff = 1'b1;
 
-         pulse_soft_clear_rx_req_ft();
+         pulse_rx_recovery_clear_req_ft();
          wait_ft_cycles(8);
 
-         if (dut.empty_loopback_fifo !== 1'b1)
-            fail("RX soft clear must force loopback FIFO empty");
-         if (dut.full_loopback_fifo !== 1'b0)
-            fail("RX soft clear must force loopback FIFO full low");
-         if (dut.rx_fifo_overflow !== 1'b0)
-            fail("RX soft clear must clear loopback overflow");
-         if (dut.rx_fifo_underflow !== 1'b0)
-            fail("RX soft clear must clear loopback underflow");
+         if (dut.loop_fifo_empty !== 1'b1)
+            fail("RX recovery clear must force loopback FIFO empty");
+         if (dut.loop_fifo_full !== 1'b0)
+            fail("RX recovery clear must force loopback FIFO full low");
          if (dut.loopback_fifo.wr_ptr_ff !== 0)
-            fail("RX soft clear must clear loopback write pointer");
+            fail("RX recovery clear must clear loopback write pointer");
          if (dut.loopback_fifo.rd_ptr_ff !== 0)
-            fail("RX soft clear must clear loopback read pointer");
+            fail("RX recovery clear must clear loopback read pointer");
       end
    endtask
 
-   task test_soft_clear_ft_state_rx;
+   task test_ft_state_clear_rx;
       begin
-         $display("INFO: Checking soft-clear primitive for FT RX capture state");
+         $display("INFO: Checking recovery clear primitive for FT RX capture state");
 
-         dut.fsm.state = 5'b10000;
-         dut.fsm.rxf_n_p1 = 1'b0;
-         dut.fsm.rx_data_ff = 32'hCAFEBABE;
-         dut.fsm.be_i_ff = 4'hF;
-         dut.loopback_ctrl.loopback_mode_p1_ff = 1'b1;
-         dut.loopback_ctrl.loopback_payload_en_ff = 1'b1;
-         dut.loopback_ctrl.ft_rx_word_valid_ff = 1'b1;
-         dut.loopback_ctrl.ft_rx_word_ff = 36'hFCAFEBABE;
+         dut.ft601_fsm.state = 5'b10000;
+         dut.ft601_fsm.rx_adapter.m_data_ff = 32'hCAFEBABE;
+         dut.ft601_fsm.rx_adapter.m_keep_ff = 4'hF;
+         dut.rx_stream_router.loopback_mode_p1_ff = 1'b1;
+         dut.rx_stream_router.loopback_payload_en_ff = 1'b1;
+         dut.rx_stream_router.cmd_valid_ff = 1'b1;
+         dut.rx_stream_router.cmd_word_ff = 36'hFCAFEBABE;
 
-         pulse_soft_clear_ft_state_req_ft();
+         pulse_ft_state_clear_req_ft();
          wait_ft_cycles(4);
 
-         if (dut.fsm.state !== 5'b00001)
-            fail("FT-state soft clear must return FSM to ARB");
-         if (dut.fsm.rx_data_ff !== {DATA_LEN{1'b0}})
-            fail("FT-state soft clear must clear RX data register");
-         if (dut.fsm.be_i_ff !== {BE_LEN{1'b0}})
-            fail("FT-state soft clear must clear RX byte-enable register");
-         if (dut.loopback_ctrl.ft_rx_word_ff !== {FIFO_RX_LEN{1'b0}})
-            fail("FT-state soft clear must clear captured FT RX word");
-         if (dut.loopback_ctrl.ft_rx_word_valid_ff !== 1'b0)
-            fail("FT-state soft clear must clear FT RX valid flag");
-         if (dut.loopback_ctrl.loopback_payload_en_ff !== 1'b0)
-            fail("FT-state soft clear must close loopback payload gate");
+         if (dut.ft601_fsm.state !== 5'b00001)
+            fail("FT-state clear must return FSM to ARB");
+         if (dut.ft601_fsm.rx_adapter.m_data_ff !== {DATA_LEN{1'b0}})
+            fail("FT-state clear must clear RX data register");
+         if (dut.ft601_fsm.rx_adapter.m_keep_ff !== {BE_LEN{1'b0}})
+            fail("FT-state clear must clear RX byte-enable register");
+         if (dut.rx_stream_router.cmd_word_ff !== {FIFO_RX_LEN{1'b0}})
+            fail("FT-state clear must clear captured FT RX word");
+         if (dut.rx_stream_router.cmd_valid_ff !== 1'b0)
+            fail("FT-state clear must clear FT RX valid flag");
+         if (dut.rx_stream_router.loopback_payload_en_ff !== 1'b0)
+            fail("FT-state clear must close loopback payload gate");
       end
    endtask
 
-   task test_soft_clear_ft_state_tx;
+   task test_ft_state_clear_tx;
       begin
-         $display("INFO: Checking soft-clear primitive for FT TX prefetch/state");
+         $display("INFO: Checking recovery clear primitive for FT TX prefetch/state");
 
-         dut.fsm.state = 5'b00100;
-         dut.fsm.tx_stage_ff = 32'h11112222;
-         dut.fsm.tx_prefetch_ff = 32'h33334444;
-         dut.fsm.tx_stage_be_ff = 4'hF;
-         dut.fsm.tx_prefetch_be_ff = 4'hE;
-         dut.fsm.tx_data_ff = 32'h55556666;
-         dut.fsm.be_o_ff = 4'hD;
-         dut.fsm.tx_data_valid_ff = 1'b1;
-         dut.fsm.tx_prefetch_valid_ff = 1'b1;
-         dut.fsm.tx_prefetch_pending_ff = 1'b1;
+         dut.ft601_fsm.state = 5'b00100;
+         dut.ft601_fsm.tx_adapter.lookahead_data_ff = 32'h33334444;
+         dut.ft601_fsm.tx_adapter.lookahead_keep_ff = 4'hE;
+         dut.ft601_fsm.tx_adapter.data_ff = 32'h55556666;
+         dut.ft601_fsm.tx_adapter.keep_ff = 4'hD;
+         dut.ft601_fsm.tx_adapter.word_valid_ff = 1'b1;
+         dut.ft601_fsm.tx_adapter.lookahead_valid_ff = 1'b1;
+         dut.ft601_fsm.tx_adapter.s_fire_pending_ff = 1'b1;
 
-         pulse_soft_clear_ft_state_req_ft();
+         pulse_ft_state_clear_req_ft();
          wait_ft_cycles(4);
 
-         if (dut.fsm.state !== 5'b00001)
-            fail("FT-state soft clear must return TX FSM to ARB");
-         if (dut.fsm.tx_stage_ff !== {DATA_LEN{1'b0}})
-            fail("FT-state soft clear must clear TX stage register");
-         if (dut.fsm.tx_prefetch_ff !== {DATA_LEN{1'b0}})
-            fail("FT-state soft clear must clear TX prefetch register");
-         if (dut.fsm.tx_stage_be_ff !== {BE_LEN{1'b0}})
-            fail("FT-state soft clear must clear TX stage BE");
-         if (dut.fsm.tx_prefetch_be_ff !== {BE_LEN{1'b0}})
-            fail("FT-state soft clear must clear TX prefetch BE");
-         if (dut.fsm.tx_data_ff !== {DATA_LEN{1'b0}})
-            fail("FT-state soft clear must clear TX output data register");
-         if (dut.fsm.be_o_ff !== {BE_LEN{1'b0}})
-            fail("FT-state soft clear must clear TX output BE register");
-         if (dut.fsm.tx_data_valid_ff !== 1'b0)
-            fail("FT-state soft clear must clear TX data valid");
-         if (dut.fsm.tx_prefetch_valid_ff !== 1'b0)
-            fail("FT-state soft clear must clear TX prefetch valid");
-         if (dut.fsm.tx_prefetch_pending_ff !== 1'b0)
-            fail("FT-state soft clear must clear TX prefetch pending");
+         if (dut.ft601_fsm.state !== 5'b00001)
+            fail("FT-state clear must return TX FSM to ARB");
+         if (dut.ft601_fsm.tx_adapter.lookahead_data_ff !== {DATA_LEN{1'b0}})
+            fail("FT-state clear must clear TX lookahead register");
+         if (dut.ft601_fsm.tx_adapter.lookahead_keep_ff !== {BE_LEN{1'b0}})
+            fail("FT-state clear must clear TX lookahead keep");
+         if (dut.ft601_fsm.tx_adapter.data_ff !== {DATA_LEN{1'b0}})
+            fail("FT-state clear must clear TX output data register");
+         if (dut.ft601_fsm.tx_adapter.keep_ff !== {BE_LEN{1'b0}})
+            fail("FT-state clear must clear TX output BE register");
+         if (dut.ft601_fsm.tx_adapter.word_valid_ff !== 1'b0)
+            fail("FT-state clear must clear TX data valid");
+         if (dut.ft601_fsm.tx_adapter.lookahead_valid_ff !== 1'b0)
+            fail("FT-state clear must clear TX lookahead valid");
+         if (dut.ft601_fsm.tx_adapter.s_fire_pending_ff !== 1'b0)
+            fail("FT-state clear must clear TX request pending");
       end
    endtask
 
@@ -1176,76 +1542,103 @@ module testbench;
          force dut.tx_prefetch_en = 1'b0;
          cmd_valid_pulses_n = 0;
 
-         dut.fifo_tx.wr_ptr_bin = 14'd5;
-         dut.fifo_tx.rd_ptr_bin = 14'd3;
-         dut.fifo_tx.wr_ptr_gray = 14'd7;
-         dut.fifo_tx.rd_ptr_gray = 14'd2;
-         dut.fifo_tx.wr_ptr_gray_sync1 = 14'd7;
-         dut.fifo_tx.wr_ptr_gray_sync2 = 14'd7;
-         dut.fifo_tx.rd_ptr_gray_sync1 = 14'd2;
-         dut.fifo_tx.rd_ptr_gray_sync2 = 14'd2;
-         dut.fifo_tx.empty_ff = 1'b0;
-         dut.fifo_tx.full_ff = 1'b1;
-         dut.fifo_tx.overflow_ff = 1'b1;
+         dut.async_fifo.wr_ptr_bin = 14'd5;
+         dut.async_fifo.rd_ptr_bin = 14'd3;
+         dut.async_fifo.wr_ptr_gray = 14'd7;
+         dut.async_fifo.rd_ptr_gray = 14'd2;
+         dut.async_fifo.wr_ptr_gray_sync1 = 14'd7;
+         dut.async_fifo.wr_ptr_gray_sync2 = 14'd7;
+         dut.async_fifo.rd_ptr_gray_sync1 = 14'd2;
+         dut.async_fifo.rd_ptr_gray_sync2 = 14'd2;
+         dut.async_fifo.empty_ff = 1'b0;
+         dut.async_fifo.full_ff = 1'b1;
          dut.tx_guard.tx_fifo_error_wr_ff = 1'b1;
-         dut.host_cmd.tx_fifo_error_ff = 1'b1;
-         dut.fsm.state = 5'b00100;
-         dut.fsm.tx_stage_ff = 32'h11112222;
-         dut.fsm.tx_prefetch_ff = 32'h33334444;
-         dut.fsm.tx_stage_be_ff = 4'hF;
-         dut.fsm.tx_prefetch_be_ff = 4'hE;
-         dut.fsm.tx_data_ff = 32'h55556666;
-         dut.fsm.be_o_ff = 4'hD;
-         dut.fsm.tx_data_valid_ff = 1'b1;
-         dut.fsm.tx_prefetch_valid_ff = 1'b1;
-         dut.fsm.tx_prefetch_pending_ff = 1'b1;
+         dut.service_cmd_decoder.tx_fifo_error_ff = 1'b1;
+         dut.ft601_fsm.state = 5'b00100;
+         dut.ft601_fsm.tx_adapter.lookahead_data_ff = 32'h33334444;
+         dut.ft601_fsm.tx_adapter.lookahead_keep_ff = 4'hE;
+         dut.ft601_fsm.tx_adapter.data_ff = 32'h55556666;
+         dut.ft601_fsm.tx_adapter.keep_ff = 4'hD;
+         dut.ft601_fsm.tx_adapter.word_valid_ff = 1'b1;
+         dut.ft601_fsm.tx_adapter.lookahead_valid_ff = 1'b1;
+         dut.ft601_fsm.tx_adapter.s_fire_pending_ff = 1'b1;
 
          send_ft_command_frame(CMD_CLR_TX_ERROR);
          wait_ft_cycles(12);
          wait_gpio_cycles(12);
+         wait_ft_cycles(8);
 
          if (cmd_valid_pulses_n !== 1)
             fail("CMD_CLR_TX_ERROR must generate exactly one cmd_valid pulse");
-         if (dut.host_cmd.tx_fifo_error_ff !== 1'b0)
+         if (dut.service_cmd_decoder.tx_fifo_error_ff !== 1'b0)
             fail("CMD_CLR_TX_ERROR must clear host TX sticky error");
          if (dut.tx_guard.tx_fifo_error_wr_ff !== 1'b0)
             fail("CMD_CLR_TX_ERROR must clear gpio TX write guard sticky error");
-         if (dut.empty_fifo !== 1'b1)
+         if (dut.normal_fifo_empty !== 1'b1)
             fail("CMD_CLR_TX_ERROR must recover async TX FIFO to empty");
-         if (dut.full_fifo !== 1'b0)
+         if (dut.normal_fifo_full !== 1'b0)
             fail("CMD_CLR_TX_ERROR must clear async TX FIFO full");
-         if (dut.tx_fifo_overflow !== 1'b0)
-            fail("CMD_CLR_TX_ERROR must clear TX FIFO overflow");
-         if (dut.tx_fifo_underflow !== 1'b0)
-            fail("CMD_CLR_TX_ERROR must clear TX FIFO underflow");
-         if (dut.fifo_tx.wr_ptr_bin !== 0)
+         if (dut.async_fifo.wr_ptr_bin !== 0)
             fail("CMD_CLR_TX_ERROR must clear TX FIFO write pointer");
-         if (dut.fifo_tx.rd_ptr_bin !== 0)
+         if (dut.async_fifo.rd_ptr_bin !== 0)
             fail("CMD_CLR_TX_ERROR must clear TX FIFO read pointer");
-         if (dut.fsm.state !== 5'b00001)
+         if (dut.ft601_fsm.state !== 5'b00001)
             fail("CMD_CLR_TX_ERROR must return FSM to ARB");
-         if (dut.fsm.tx_stage_ff !== {DATA_LEN{1'b0}})
-            fail("CMD_CLR_TX_ERROR must clear TX stage register");
-         if (dut.fsm.tx_prefetch_ff !== {DATA_LEN{1'b0}})
-            fail("CMD_CLR_TX_ERROR must clear TX prefetch register");
-         if (dut.fsm.tx_data_ff !== {DATA_LEN{1'b0}})
+         if (dut.ft601_fsm.tx_adapter.lookahead_data_ff !== {DATA_LEN{1'b0}})
+            fail("CMD_CLR_TX_ERROR must clear TX lookahead register");
+         if (dut.ft601_fsm.tx_adapter.data_ff !== {DATA_LEN{1'b0}})
             fail("CMD_CLR_TX_ERROR must clear TX output register");
-         if (dut.fsm.tx_data_valid_ff !== 1'b0)
+         if (dut.ft601_fsm.tx_adapter.word_valid_ff !== 1'b0)
             fail("CMD_CLR_TX_ERROR must clear TX valid state");
-         if (dut.fsm.tx_prefetch_valid_ff !== 1'b0)
-            fail("CMD_CLR_TX_ERROR must clear TX prefetch valid");
-         if (dut.fsm.tx_prefetch_pending_ff !== 1'b0)
-            fail("CMD_CLR_TX_ERROR must clear TX prefetch pending");
-         if (dut.soft_clear_tx_req_ft !== 1'b0)
+         if (dut.ft601_fsm.tx_adapter.lookahead_valid_ff !== 1'b0)
+            fail("CMD_CLR_TX_ERROR must clear TX lookahead valid");
+         if (dut.ft601_fsm.tx_adapter.s_fire_pending_ff !== 1'b0)
+            fail("CMD_CLR_TX_ERROR must clear TX request pending");
+         if (dut.tx_recovery_clear_req_ft !== 1'b0)
             fail("CMD_CLR_TX_ERROR TX recovery pulse must self-clear");
-         if (dut.soft_clear_ft_state_req_ft !== 1'b0)
+         if (dut.ft_state_clear_req_ft !== 1'b0)
             fail("CMD_CLR_TX_ERROR FT-state recovery pulse must self-clear");
          if (dut.loopback_mode_ft !== 1'b0)
             fail("CMD_CLR_TX_ERROR must not change current mode");
-         if (dut.rx_fifo_error_i !== 1'b0)
+         if (dut.rx_error !== 1'b0)
             fail("CMD_CLR_TX_ERROR test must not leave unrelated RX sticky error asserted");
 
          release dut.tx_prefetch_en;
+      end
+   endtask
+
+   task test_cmd_reset_ft_state_keeps_tx_fifo;
+      begin
+         if (dut.loopback_mode_ft !== 1'b0)
+            fail("CMD_RESET_FT_STATE test must start in normal mode");
+
+         ft_txe_n = 1'b1;
+         send_first_expected_gpio_words(4);
+         wait_gpio_cycles(8);
+         wait_ft_cycles(4);
+
+         if (dut.normal_fifo_empty !== 1'b0)
+            fail("CMD_RESET_FT_STATE test needs pending normal TX data");
+
+         cmd_valid_pulses_n = 0;
+         send_ft_command_frame(CMD_RESET_FT_STATE);
+         wait_ft_cycles(12);
+         wait_gpio_cycles(4);
+
+         if (cmd_valid_pulses_n !== 1)
+            fail("CMD_RESET_FT_STATE must generate exactly one cmd_valid pulse");
+         if (dut.tx_recovery_clear_req_ft !== 1'b0)
+            fail("CMD_RESET_FT_STATE must not request TX async FIFO clear");
+         if (dut.rx_recovery_clear_req_ft !== 1'b0)
+            fail("CMD_RESET_FT_STATE must not request loopback FIFO clear");
+         if (dut.normal_fifo_empty !== 1'b0)
+            fail("CMD_RESET_FT_STATE must preserve pending normal TX FIFO data");
+         if (dut.loopback_mode_ft !== 1'b0)
+            fail("CMD_RESET_FT_STATE must leave runtime mode in normal state");
+         if (ft_reset_n !== 1'b1)
+            fail("CMD_RESET_FT_STATE must not toggle physical FT601 RESET_N");
+         if (dut.ft_state_clear_req_ft !== 1'b0)
+            fail("CMD_RESET_FT_STATE FT-state clear pulse must self-clear");
       end
    endtask
 
@@ -1261,17 +1654,14 @@ module testbench;
          dut.loopback_fifo.data_ff = 36'hF55667788;
          dut.loopback_fifo.empty_ff = 1'b0;
          dut.loopback_fifo.full_ff = 1'b1;
-         dut.loopback_fifo.overflow_ff = 1'b1;
-         dut.loopback_fifo.underflow_ff = 1'b1;
-         dut.host_cmd.rx_fifo_error_ff = 1'b1;
-         dut.fsm.state = 5'b10000;
-         dut.fsm.rxf_n_p1 = 1'b0;
-         dut.fsm.rx_data_ff = 32'hCAFEBABE;
-         dut.fsm.be_i_ff = 4'hF;
-         dut.loopback_ctrl.loopback_mode_p1_ff = 1'b1;
-         dut.loopback_ctrl.loopback_payload_en_ff = 1'b1;
-         dut.loopback_ctrl.ft_rx_word_valid_ff = 1'b1;
-         dut.loopback_ctrl.ft_rx_word_ff = 36'hFCAFEBABE;
+         dut.service_cmd_decoder.rx_fifo_error_ff = 1'b1;
+         dut.ft601_fsm.state = 5'b10000;
+         dut.ft601_fsm.rx_adapter.m_data_ff = 32'hCAFEBABE;
+         dut.ft601_fsm.rx_adapter.m_keep_ff = 4'hF;
+         dut.rx_stream_router.loopback_mode_p1_ff = 1'b1;
+         dut.rx_stream_router.loopback_payload_en_ff = 1'b1;
+         dut.rx_stream_router.cmd_valid_ff = 1'b1;
+         dut.rx_stream_router.cmd_word_ff = 36'hFCAFEBABE;
 
          send_ft_command_frame(CMD_CLR_RX_ERROR);
          wait_ft_cycles(12);
@@ -1279,35 +1669,31 @@ module testbench;
 
          if (cmd_valid_pulses_n !== 1)
             fail("CMD_CLR_RX_ERROR must generate exactly one cmd_valid pulse");
-         if (dut.host_cmd.rx_fifo_error_ff !== 1'b0)
+         if (dut.service_cmd_decoder.rx_fifo_error_ff !== 1'b0)
             fail("CMD_CLR_RX_ERROR must clear host RX sticky error");
-         if (dut.empty_loopback_fifo !== 1'b1)
+         if (dut.loop_fifo_empty !== 1'b1)
             fail("CMD_CLR_RX_ERROR must recover loopback FIFO to empty");
-         if (dut.full_loopback_fifo !== 1'b0)
+         if (dut.loop_fifo_full !== 1'b0)
             fail("CMD_CLR_RX_ERROR must clear loopback FIFO full");
-         if (dut.rx_fifo_overflow !== 1'b0)
-            fail("CMD_CLR_RX_ERROR must clear loopback FIFO overflow");
-         if (dut.rx_fifo_underflow !== 1'b0)
-            fail("CMD_CLR_RX_ERROR must clear loopback FIFO underflow");
          if (dut.loopback_fifo.wr_ptr_ff !== 0)
             fail("CMD_CLR_RX_ERROR must clear loopback FIFO write pointer");
          if (dut.loopback_fifo.rd_ptr_ff !== 0)
             fail("CMD_CLR_RX_ERROR must clear loopback FIFO read pointer");
-         if (dut.fsm.state !== 5'b00001)
+         if (dut.ft601_fsm.state !== 5'b00001)
             fail("CMD_CLR_RX_ERROR must return FSM to ARB");
-         if (dut.fsm.rx_data_ff !== {DATA_LEN{1'b0}})
+         if (dut.ft601_fsm.rx_adapter.m_data_ff !== {DATA_LEN{1'b0}})
             fail("CMD_CLR_RX_ERROR must clear FT RX capture register");
-         if (dut.fsm.be_i_ff !== {BE_LEN{1'b0}})
+         if (dut.ft601_fsm.rx_adapter.m_keep_ff !== {BE_LEN{1'b0}})
             fail("CMD_CLR_RX_ERROR must clear FT RX BE register");
-         if (dut.loopback_ctrl.ft_rx_word_ff !== {FIFO_RX_LEN{1'b0}})
+         if (dut.rx_stream_router.cmd_word_ff !== {FIFO_RX_LEN{1'b0}})
             fail("CMD_CLR_RX_ERROR must clear captured FT RX word");
-         if (dut.loopback_ctrl.ft_rx_word_valid_ff !== 1'b0)
+         if (dut.rx_stream_router.cmd_valid_ff !== 1'b0)
             fail("CMD_CLR_RX_ERROR must clear FT RX valid flag");
-         if (dut.loopback_ctrl.loopback_payload_en_ff !== 1'b0)
+         if (dut.rx_stream_router.loopback_payload_en_ff !== 1'b0)
             fail("CMD_CLR_RX_ERROR must close loopback payload gate");
-         if (dut.soft_clear_rx_req_ft !== 1'b0)
+         if (dut.rx_recovery_clear_req_ft !== 1'b0)
             fail("CMD_CLR_RX_ERROR RX recovery pulse must self-clear");
-         if (dut.soft_clear_ft_state_req_ft !== 1'b0)
+         if (dut.ft_state_clear_req_ft !== 1'b0)
             fail("CMD_CLR_RX_ERROR FT-state recovery pulse must self-clear");
          if (dut.loopback_mode_ft !== 1'b1)
             fail("CMD_CLR_RX_ERROR must not change current mode");
@@ -1325,102 +1711,87 @@ module testbench;
          force dut.tx_prefetch_en = 1'b0;
          cmd_valid_pulses_n = 0;
 
-         dut.fifo_tx.wr_ptr_bin = 14'd6;
-         dut.fifo_tx.rd_ptr_bin = 14'd2;
-         dut.fifo_tx.wr_ptr_gray = 14'd5;
-         dut.fifo_tx.rd_ptr_gray = 14'd3;
-         dut.fifo_tx.wr_ptr_gray_sync1 = 14'd5;
-         dut.fifo_tx.wr_ptr_gray_sync2 = 14'd5;
-         dut.fifo_tx.rd_ptr_gray_sync1 = 14'd3;
-         dut.fifo_tx.rd_ptr_gray_sync2 = 14'd3;
-         dut.fifo_tx.empty_ff = 1'b0;
-         dut.fifo_tx.full_ff = 1'b1;
-         dut.fifo_tx.overflow_ff = 1'b1;
+         dut.async_fifo.wr_ptr_bin = 14'd6;
+         dut.async_fifo.rd_ptr_bin = 14'd2;
+         dut.async_fifo.wr_ptr_gray = 14'd5;
+         dut.async_fifo.rd_ptr_gray = 14'd3;
+         dut.async_fifo.wr_ptr_gray_sync1 = 14'd5;
+         dut.async_fifo.wr_ptr_gray_sync2 = 14'd5;
+         dut.async_fifo.rd_ptr_gray_sync1 = 14'd3;
+         dut.async_fifo.rd_ptr_gray_sync2 = 14'd3;
+         dut.async_fifo.empty_ff = 1'b0;
+         dut.async_fifo.full_ff = 1'b1;
          dut.tx_guard.tx_fifo_error_wr_ff = 1'b1;
-         dut.host_cmd.tx_fifo_error_ff = 1'b1;
+         dut.service_cmd_decoder.tx_fifo_error_ff = 1'b1;
 
          dut.loopback_fifo.wr_ptr_ff = 14'd5;
          dut.loopback_fifo.rd_ptr_ff = 14'd1;
          dut.loopback_fifo.data_ff = 36'hE10203040;
          dut.loopback_fifo.empty_ff = 1'b0;
          dut.loopback_fifo.full_ff = 1'b1;
-         dut.loopback_fifo.overflow_ff = 1'b1;
-         dut.loopback_fifo.underflow_ff = 1'b1;
-         dut.host_cmd.rx_fifo_error_ff = 1'b1;
+         dut.service_cmd_decoder.rx_fifo_error_ff = 1'b1;
 
-         dut.fsm.state = 5'b00100;
-         dut.fsm.rxf_n_p1 = 1'b0;
-         dut.fsm.rx_data_ff = 32'h12345678;
-         dut.fsm.be_i_ff = 4'hC;
-         dut.fsm.tx_stage_ff = 32'h89ABCDEF;
-         dut.fsm.tx_prefetch_ff = 32'h76543210;
-         dut.fsm.tx_stage_be_ff = 4'hF;
-         dut.fsm.tx_prefetch_be_ff = 4'hA;
-         dut.fsm.tx_data_ff = 32'h0BADF00D;
-         dut.fsm.be_o_ff = 4'hB;
-         dut.fsm.tx_data_valid_ff = 1'b1;
-         dut.fsm.tx_prefetch_valid_ff = 1'b1;
-         dut.fsm.tx_prefetch_pending_ff = 1'b1;
-         dut.loopback_ctrl.loopback_mode_p1_ff = 1'b1;
-         dut.loopback_ctrl.loopback_payload_en_ff = 1'b1;
-         dut.loopback_ctrl.ft_rx_word_valid_ff = 1'b1;
-         dut.loopback_ctrl.ft_rx_word_ff = 36'hE55667788;
+         dut.ft601_fsm.state = 5'b00100;
+         dut.ft601_fsm.rx_adapter.m_data_ff = 32'h12345678;
+         dut.ft601_fsm.rx_adapter.m_keep_ff = 4'hC;
+         dut.ft601_fsm.tx_adapter.lookahead_data_ff = 32'h76543210;
+         dut.ft601_fsm.tx_adapter.lookahead_keep_ff = 4'hA;
+         dut.ft601_fsm.tx_adapter.data_ff = 32'h0BADF00D;
+         dut.ft601_fsm.tx_adapter.keep_ff = 4'hB;
+         dut.ft601_fsm.tx_adapter.word_valid_ff = 1'b1;
+         dut.ft601_fsm.tx_adapter.lookahead_valid_ff = 1'b1;
+         dut.ft601_fsm.tx_adapter.s_fire_pending_ff = 1'b1;
+         dut.rx_stream_router.loopback_mode_p1_ff = 1'b1;
+         dut.rx_stream_router.loopback_payload_en_ff = 1'b1;
+         dut.rx_stream_router.cmd_valid_ff = 1'b1;
+         dut.rx_stream_router.cmd_word_ff = 36'hE55667788;
 
          send_ft_command_frame(CMD_CLR_ALL_ERROR);
          wait_ft_cycles(12);
          wait_gpio_cycles(12);
+         wait_ft_cycles(8);
 
          if (cmd_valid_pulses_n !== 1)
             fail("CMD_CLR_ALL_ERROR must generate exactly one cmd_valid pulse");
-         if (dut.host_cmd.tx_fifo_error_ff !== 1'b0)
+         if (dut.service_cmd_decoder.tx_fifo_error_ff !== 1'b0)
             fail("CMD_CLR_ALL_ERROR must clear host TX sticky error");
-         if (dut.host_cmd.rx_fifo_error_ff !== 1'b0)
+         if (dut.service_cmd_decoder.rx_fifo_error_ff !== 1'b0)
             fail("CMD_CLR_ALL_ERROR must clear host RX sticky error");
          if (dut.tx_guard.tx_fifo_error_wr_ff !== 1'b0)
             fail("CMD_CLR_ALL_ERROR must clear gpio TX guard sticky error");
-         if (dut.empty_fifo !== 1'b1)
+         if (dut.normal_fifo_empty !== 1'b1)
             fail("CMD_CLR_ALL_ERROR must recover async TX FIFO to empty");
-         if (dut.full_fifo !== 1'b0)
+         if (dut.normal_fifo_full !== 1'b0)
             fail("CMD_CLR_ALL_ERROR must clear async TX FIFO full");
-         if (dut.tx_fifo_overflow !== 1'b0)
-            fail("CMD_CLR_ALL_ERROR must clear TX FIFO overflow");
-         if (dut.tx_fifo_underflow !== 1'b0)
-            fail("CMD_CLR_ALL_ERROR must clear TX FIFO underflow");
-         if (dut.empty_loopback_fifo !== 1'b1)
+         if (dut.loop_fifo_empty !== 1'b1)
             fail("CMD_CLR_ALL_ERROR must recover loopback FIFO to empty");
-         if (dut.full_loopback_fifo !== 1'b0)
+         if (dut.loop_fifo_full !== 1'b0)
             fail("CMD_CLR_ALL_ERROR must clear loopback FIFO full");
-         if (dut.rx_fifo_overflow !== 1'b0)
-            fail("CMD_CLR_ALL_ERROR must clear loopback FIFO overflow");
-         if (dut.rx_fifo_underflow !== 1'b0)
-            fail("CMD_CLR_ALL_ERROR must clear loopback FIFO underflow");
-         if (dut.fsm.state !== 5'b00001)
+         if (dut.ft601_fsm.state !== 5'b00001)
             fail("CMD_CLR_ALL_ERROR must return FSM to ARB");
-         if (dut.fsm.rx_data_ff !== {DATA_LEN{1'b0}})
+         if (dut.ft601_fsm.rx_adapter.m_data_ff !== {DATA_LEN{1'b0}})
             fail("CMD_CLR_ALL_ERROR must clear FT RX capture state");
-         if (dut.fsm.tx_stage_ff !== {DATA_LEN{1'b0}})
-            fail("CMD_CLR_ALL_ERROR must clear FT TX stage state");
-         if (dut.fsm.tx_prefetch_ff !== {DATA_LEN{1'b0}})
-            fail("CMD_CLR_ALL_ERROR must clear FT TX prefetch state");
-         if (dut.fsm.tx_data_ff !== {DATA_LEN{1'b0}})
+         if (dut.ft601_fsm.tx_adapter.lookahead_data_ff !== {DATA_LEN{1'b0}})
+            fail("CMD_CLR_ALL_ERROR must clear FT TX lookahead state");
+         if (dut.ft601_fsm.tx_adapter.data_ff !== {DATA_LEN{1'b0}})
             fail("CMD_CLR_ALL_ERROR must clear FT TX output state");
-         if (dut.fsm.tx_data_valid_ff !== 1'b0)
+         if (dut.ft601_fsm.tx_adapter.word_valid_ff !== 1'b0)
             fail("CMD_CLR_ALL_ERROR must clear TX valid state");
-         if (dut.fsm.tx_prefetch_valid_ff !== 1'b0)
-            fail("CMD_CLR_ALL_ERROR must clear TX prefetch valid");
-         if (dut.fsm.tx_prefetch_pending_ff !== 1'b0)
-            fail("CMD_CLR_ALL_ERROR must clear TX prefetch pending");
-         if (dut.loopback_ctrl.ft_rx_word_ff !== {FIFO_RX_LEN{1'b0}})
+         if (dut.ft601_fsm.tx_adapter.lookahead_valid_ff !== 1'b0)
+            fail("CMD_CLR_ALL_ERROR must clear TX lookahead valid");
+         if (dut.ft601_fsm.tx_adapter.s_fire_pending_ff !== 1'b0)
+            fail("CMD_CLR_ALL_ERROR must clear TX request pending");
+         if (dut.rx_stream_router.cmd_word_ff !== {FIFO_RX_LEN{1'b0}})
             fail("CMD_CLR_ALL_ERROR must clear captured FT RX word");
-         if (dut.loopback_ctrl.ft_rx_word_valid_ff !== 1'b0)
+         if (dut.rx_stream_router.cmd_valid_ff !== 1'b0)
             fail("CMD_CLR_ALL_ERROR must clear FT RX valid flag");
-         if (dut.loopback_ctrl.loopback_payload_en_ff !== 1'b0)
+         if (dut.rx_stream_router.loopback_payload_en_ff !== 1'b0)
             fail("CMD_CLR_ALL_ERROR must close loopback payload gate");
-         if (dut.soft_clear_tx_req_ft !== 1'b0)
+         if (dut.tx_recovery_clear_req_ft !== 1'b0)
             fail("CMD_CLR_ALL_ERROR TX recovery pulse must self-clear");
-         if (dut.soft_clear_rx_req_ft !== 1'b0)
+         if (dut.rx_recovery_clear_req_ft !== 1'b0)
             fail("CMD_CLR_ALL_ERROR RX recovery pulse must self-clear");
-         if (dut.soft_clear_ft_state_req_ft !== 1'b0)
+         if (dut.ft_state_clear_req_ft !== 1'b0)
             fail("CMD_CLR_ALL_ERROR FT-state recovery pulse must self-clear");
          if (dut.loopback_mode_ft !== 1'b1)
             fail("CMD_CLR_ALL_ERROR must not change current mode");
@@ -1444,7 +1815,7 @@ module testbench;
             fail("control frame must not increment loopback RX payload counter");
          if (cmd_valid_pulses_n !== 1)
             fail("one control frame must generate exactly one cmd_valid pulse");
-         if (dut.empty_loopback_fifo !== 1'b1)
+         if (dut.loop_fifo_empty !== 1'b1)
             fail("control frame must not leave data inside loopback FIFO");
          wait_gpio_cycles(4);
 
@@ -1470,26 +1841,16 @@ module testbench;
             fail("RD_N never became active in loopback mode");
          if (oe_active_cycles_n == 0)
             fail("OE_N never became active in loopback mode");
-         if (dut.empty_loopback_fifo !== 1'b1)
+         if (dut.loop_fifo_empty !== 1'b1)
             fail("Loopback FIFO is not empty after loopback transmission");
          rx_payload_check_en = 1'b0;
-         $display("INFO: TX assert latency max=%0d FT clocks, release latency max=%0d FT clocks", tx_assert_cycles_max + 1, tx_release_cycles_max + 1);
-         if (tx_assert_events_n == 0)
-            fail("TX assert latency was never measured in loopback mode");
-         if (tx_release_events_n == 0)
-            fail("TX release latency was never measured in loopback mode");
-         if (rx_oe_assert_events_n == 0)
-            fail("RX OE_N assert latency was never measured in loopback mode");
-         if (rx_rd_assert_events_n == 0)
-            fail("RX RD_N assert latency was never measured in loopback mode");
-         if (rx_oe_release_events_n == 0)
-            fail("RX OE_N release latency was never measured in loopback mode");
-         if (rx_rd_release_events_n == 0)
-            fail("RX RD_N release latency was never measured in loopback mode");
+         check_payload_tx_latency("Loopback mode");
+         check_payload_rx_latency("Loopback mode");
+         $display("INFO: TX assert latency max=%0d FT clocks, release latency max=%0d FT clocks", tx_assert_cycles_max, tx_release_cycles_max);
          $display("INFO: RX assert latency max: RXF_N->OE_N=%0d FT clocks, RXF_N->RD_N=%0d FT clocks",
-                  rx_oe_assert_cycles_max + 1, rx_rd_assert_cycles_max + 1);
+                  rx_oe_assert_cycles_max, rx_rd_assert_cycles_max);
          $display("INFO: RX release latency max: RXF_N->OE_N=%0d FT clocks, RXF_N->RD_N=%0d FT clocks",
-                  rx_oe_release_cycles_max + 1, rx_rd_release_cycles_max + 1);
+                  rx_oe_release_cycles_max, rx_rd_release_cycles_max);
          $display("INFO: Loopback mode test passed, looped back %0d words", tx_words_n);
       end
    endtask
@@ -1498,7 +1859,7 @@ module testbench;
       begin
          if (dut.loopback_mode_ft !== 1'b1)
             fail("opcode-without-magic test must start in loopback mode");
-         if (dut.empty_loopback_fifo !== 1'b1)
+         if (dut.loop_fifo_empty !== 1'b1)
             fail("opcode-without-magic test requires empty loopback FIFO");
 
          $display("INFO: Checking that opcode without CMD_MAGIC is treated as loopback payload");
@@ -1510,7 +1871,7 @@ module testbench;
             fail("opcode without CMD_MAGIC must not generate cmd_valid");
          if (dut.loopback_mode_ft !== 1'b1)
             fail("opcode without CMD_MAGIC must not switch mode");
-         if (dut.empty_loopback_fifo !== 1'b0)
+         if (dut.loop_fifo_empty !== 1'b0)
             fail("opcode without CMD_MAGIC must be stored as loopback payload");
       end
    endtask
@@ -1531,7 +1892,7 @@ module testbench;
             fail("unknown command frame must not generate cmd_valid");
          if (dut.loopback_mode_ft !== 1'b1)
             fail("unknown command frame must not switch mode");
-         if (dut.empty_loopback_fifo !== 1'b1)
+         if (dut.loop_fifo_empty !== 1'b1)
             fail("unknown command frame must not be written into loopback FIFO");
       end
    endtask
@@ -1547,7 +1908,7 @@ module testbench;
          send_first_expected_gpio_words(4);
          wait_gpio_cycles(8);
 
-         if (dut.empty_fifo !== 1'b0)
+         if (dut.normal_fifo_empty !== 1'b0)
             fail("normal-to-loopback switch test needs non-empty normal TX FIFO");
 
          cmd_valid_pulses_n = 0;
@@ -1555,14 +1916,10 @@ module testbench;
 
          if (cmd_valid_pulses_n !== 1)
             fail("CMD_SET_LOOPBACK must generate exactly one cmd_valid pulse");
-         if (dut.empty_fifo !== 1'b1)
+         if (dut.normal_fifo_empty !== 1'b1)
             fail("CMD_SET_LOOPBACK must clear normal TX FIFO during mode switch");
-         if (dut.full_fifo !== 1'b0)
+         if (dut.normal_fifo_full !== 1'b0)
             fail("CMD_SET_LOOPBACK must clear normal TX FIFO full flag");
-         if (dut.tx_fifo_overflow !== 1'b0)
-            fail("CMD_SET_LOOPBACK must clear normal TX FIFO overflow flag");
-         if (dut.tx_fifo_underflow !== 1'b0)
-            fail("CMD_SET_LOOPBACK must clear normal TX FIFO underflow flag");
 
          @(posedge ft_clk);
          ft_set_txe_now(1'b0);
@@ -1593,14 +1950,10 @@ module testbench;
 
          if (cmd_valid_pulses_n !== 1)
             fail("CMD_SET_NORMAL must generate exactly one cmd_valid pulse");
-         if (dut.empty_loopback_fifo !== 1'b1)
+         if (dut.loop_fifo_empty !== 1'b1)
             fail("CMD_SET_NORMAL must clear loopback FIFO during mode switch");
-         if (dut.full_loopback_fifo !== 1'b0)
+         if (dut.loop_fifo_full !== 1'b0)
             fail("CMD_SET_NORMAL must clear loopback FIFO full flag");
-         if (dut.rx_fifo_overflow !== 1'b0)
-            fail("CMD_SET_NORMAL must clear loopback FIFO overflow flag");
-         if (dut.rx_fifo_underflow !== 1'b0)
-            fail("CMD_SET_NORMAL must clear loopback FIFO underflow flag");
 
          @(posedge ft_clk);
          ft_set_txe_now(1'b0);
@@ -1626,7 +1979,7 @@ module testbench;
          send_first_expected_gpio_words(8);
          wait_gpio_cycles(12);
 
-         if (dut.empty_fifo !== 1'b0)
+         if (dut.normal_fifo_empty !== 1'b0)
             fail("recent-TX switch test needs pending normal TX FIFO data");
 
          @(posedge ft_clk);
@@ -1636,7 +1989,7 @@ module testbench;
          ft_set_txe_now(1'b1);
          wait_ft_cycles(4);
 
-         if (dut.empty_fifo !== 1'b0)
+         if (dut.normal_fifo_empty !== 1'b0)
             fail("recent-TX switch test needs remaining normal TX data before switch");
 
          tx_words_before_switch = tx_words_n;
@@ -1645,7 +1998,7 @@ module testbench;
 
          if (cmd_valid_pulses_n !== 1)
             fail("recent-TX CMD_SET_LOOPBACK must generate exactly one cmd_valid pulse");
-         if (dut.empty_fifo !== 1'b1)
+         if (dut.normal_fifo_empty !== 1'b1)
             fail("CMD_SET_LOOPBACK must clear remaining normal TX data after recent TX burst");
 
          @(posedge ft_clk);
@@ -1662,16 +2015,9 @@ module testbench;
       input [DATA_LEN-1:0] expected_word
    );
       begin
-         if (tx_status_words_n !== 2)
-            fail("exactly two status response words are expected");
-         if (last_status_header_word !== STATUS_MAGIC) begin
-            $display("ERROR: status frame header got=%h expected=%h", last_status_header_word, STATUS_MAGIC);
-            $finish;
-         end
-         if (last_status_word !== expected_word) begin
-            $display("ERROR: status word got=%h expected=%h", last_status_word, expected_word);
-            $finish;
-         end
+         if (tx_total_words_n !== 2)
+            fail("exactly two TX words are expected for a pure status response");
+         expect_status_frame_at(0, expected_word);
       end
    endtask
 
@@ -1685,6 +2031,7 @@ module testbench;
          expected_status = build_status_word(1'b0, 1'b0, 1'b0, 1'b1, 1'b0, 1'b1, 1'b0);
 
          cmd_valid_pulses_n = 0;
+         tx_stream_only_mode = 1'b1;
          send_ft_command_frame(CMD_GET_STATUS);
          if (cmd_valid_pulses_n !== 1)
             fail("CMD_GET_STATUS must generate exactly one cmd_valid pulse");
@@ -1692,10 +2039,12 @@ module testbench;
          expect_no_tx_for_cycles(8);
          @(posedge ft_clk);
          ft_set_txe_now(1'b0);
-         wait_for_tx_status_words(2, 256);
+         wait_for_tx_total_words(2, 256);
          expect_status_frame(expected_status);
          @(posedge ft_clk);
          ft_set_txe_now(1'b1);
+         wait_for_ft_tx_idle();
+         tx_stream_only_mode = 1'b0;
       end
    endtask
 
@@ -1709,6 +2058,7 @@ module testbench;
          expected_status = build_status_word(1'b1, 1'b0, 1'b0, 1'b1, 1'b0, 1'b1, 1'b0);
 
          cmd_valid_pulses_n = 0;
+         tx_stream_only_mode = 1'b1;
          send_ft_command_frame(CMD_GET_STATUS);
          if (cmd_valid_pulses_n !== 1)
             fail("CMD_GET_STATUS must generate exactly one cmd_valid pulse in loopback mode");
@@ -1716,10 +2066,11 @@ module testbench;
          expect_no_tx_for_cycles(8);
          @(posedge ft_clk);
          ft_set_txe_now(1'b0);
-         wait_for_tx_status_words(2, 256);
+         wait_for_tx_total_words(2, 256);
          expect_status_frame(expected_status);
          @(posedge ft_clk);
          ft_set_txe_now(1'b1);
+         tx_stream_only_mode = 1'b0;
       end
    endtask
 
@@ -1731,32 +2082,42 @@ module testbench;
 
          $display("INFO: Checking CMD_GET_STATUS after injected errors and after CMD_CLR_ALL_ERROR");
 
-         dut.host_cmd.tx_fifo_error_ff = 1'b1;
-         dut.host_cmd.rx_fifo_error_ff = 1'b1;
+         dut.tx_guard.tx_fifo_error_wr_ff = 1'b1;
+         dut.service_cmd_decoder.rx_fifo_error_ff = 1'b1;
          wait_ft_cycles(2);
+         wait_gpio_cycles(2);
 
          expected_status = build_status_word(1'b0, 1'b1, 1'b1, 1'b1, 1'b0, 1'b1, 1'b0);
          cmd_valid_pulses_n = 0;
+         tx_stream_only_mode = 1'b1;
          send_ft_command_frame(CMD_GET_STATUS);
          @(posedge ft_clk);
          ft_set_txe_now(1'b0);
-         wait_for_tx_status_words(2, 256);
+         wait_for_tx_total_words(2, 256);
          expect_status_frame(expected_status);
          @(posedge ft_clk);
          ft_set_txe_now(1'b1);
 
          send_ft_command_frame(CMD_CLR_ALL_ERROR);
          wait_ft_cycles(8);
+         wait_gpio_cycles(8);
+
+         if (dut.tx_guard.tx_fifo_error_wr_ff !== 1'b0)
+            fail("CMD_CLR_ALL_ERROR must clear tx_write_guard fault source");
+         if (dut.service_cmd_decoder.rx_fifo_error_ff !== 1'b0)
+            fail("CMD_CLR_ALL_ERROR must clear RX diagnostic sticky state");
 
          clear_monitors();
          expected_status = build_status_word(1'b0, 1'b0, 1'b0, 1'b1, 1'b0, 1'b1, 1'b0);
+         tx_stream_only_mode = 1'b1;
          send_ft_command_frame(CMD_GET_STATUS);
          @(posedge ft_clk);
          ft_set_txe_now(1'b0);
-         wait_for_tx_status_words(2, 256);
+         wait_for_tx_total_words(2, 256);
          expect_status_frame(expected_status);
          @(posedge ft_clk);
          ft_set_txe_now(1'b1);
+         tx_stream_only_mode = 1'b0;
       end
    endtask
 
@@ -1773,12 +2134,12 @@ module testbench;
          wait_gpio_cycles(8);
          wait_ft_cycles(8);
 
-         if (dut.empty_fifo !== 1'b0)
+         if (dut.normal_fifo_empty !== 1'b0)
             fail("status-with-pending-TX test needs non-empty normal TX FIFO");
 
          expected_status = build_status_word(1'b0, 1'b0, 1'b0, 1'b0, 1'b0, 1'b1, 1'b0);
          cmd_valid_pulses_n = 0;
-         allow_tx_burst_split = 1'b1;
+         tx_stream_only_mode = 1'b1;
          send_ft_command_frame(CMD_GET_STATUS);
          if (cmd_valid_pulses_n !== 1)
             fail("CMD_GET_STATUS must generate exactly one cmd_valid pulse with pending TX payload");
@@ -1786,17 +2147,58 @@ module testbench;
          expect_no_tx_for_cycles(8);
          @(posedge ft_clk);
          ft_set_txe_now(1'b0);
-         wait_for_tx_words(4, 1200);
-         wait_for_tx_status_words(2, 1200);
-         expect_status_frame(expected_status);
-         allow_tx_burst_split = 1'b0;
+         wait_for_tx_total_words(3, 1200);
+         expect_status_frame_at(0, expected_status);
+         if (tx_captured_be[2] !== FULL_BE)
+            fail("loopback payload after status must keep full BE");
+         if (tx_captured_words[2] === STATUS_MAGIC)
+            fail("loopback payload must not repeat STATUS_MAGIC after the status frame");
          @(posedge ft_clk);
          ft_set_txe_now(1'b1);
+         tx_stream_only_mode = 1'b0;
       end
    endtask
 
-   // Capture FT601 TX words after DUT outputs settle on the previous posedge.
-   always @(negedge ft_clk or negedge ft_reset_n) begin
+   task test_get_status_with_pending_loopback_tx;
+      reg [DATA_LEN-1:0] expected_status;
+      begin
+         if (dut.loopback_mode_ft !== 1'b1)
+            fail("status-with-pending-loopback test must start in loopback mode");
+
+         $display("INFO: Checking CMD_GET_STATUS with pending loopback payload before TX burst");
+
+         ft_txe_n = 1'b1;
+         drive_first_expected_loopback_words(4);
+         wait_ft_cycles(8);
+
+         if (dut.loop_fifo_empty !== 1'b0)
+            fail("status-with-pending-loopback test needs non-empty loopback FIFO");
+
+         expected_status = build_status_word(1'b1, 1'b0, 1'b0, 1'b1, 1'b0, 1'b0, 1'b0);
+         cmd_valid_pulses_n = 0;
+         tx_stream_only_mode = 1'b1;
+         send_ft_command_frame(CMD_GET_STATUS);
+         if (cmd_valid_pulses_n !== 1)
+            fail("CMD_GET_STATUS must generate exactly one cmd_valid pulse with pending loopback payload");
+
+         expect_no_tx_for_cycles(8);
+         @(posedge ft_clk);
+         ft_set_txe_now(1'b0);
+         wait_for_tx_total_words(6, 1200);
+         expect_status_frame_at(0, expected_status);
+         expect_captured_tx_word(2, exp_words[0], FULL_BE);
+         expect_captured_tx_word(3, exp_words[1], FULL_BE);
+         expect_captured_tx_word(4, exp_words[2], FULL_BE);
+         expect_captured_tx_word(5, exp_words[3], FULL_BE);
+         @(posedge ft_clk);
+         ft_set_txe_now(1'b1);
+         wait_for_ft_tx_idle();
+         tx_stream_only_mode = 1'b0;
+      end
+   endtask
+
+   // Capture FT601 pins after the DUT posedge output boundary has settled.
+   always @(posedge ft_clk or negedge ft_reset_n) begin
       if (!ft_reset_n) begin
          tx_words_n <= 0;
          rx_words_n <= 0;
@@ -1815,19 +2217,19 @@ module testbench;
          rx_expect_release_after_rxf <= 1'b0;
       end
       else begin
-         if (dut.host_cmd.cmd_valid)
+         #TB_POSEDGE_SAMPLE_DELAY;
+
+         if (dut.service_cmd_decoder.cmd_valid)
             cmd_valid_pulses_n <= cmd_valid_pulses_n + 1;
 
          if (rx_expect_rd_after_oe) begin
-            if (ft_rd_n !== 1'b0)
-               fail("RD_N must assert one FT clock after OE_N");
-            rx_expect_rd_after_oe <= 1'b0;
+            if (ft_rd_n === 1'b0)
+               rx_expect_rd_after_oe <= 1'b0;
          end
 
          if (rx_expect_release_after_rxf) begin
-            if ((ft_oe_n !== 1'b1) || (ft_rd_n !== 1'b1))
-               fail("OE_N and RD_N must deassert one FT clock after RXF_N goes high");
-            rx_expect_release_after_rxf <= 1'b0;
+            if ((ft_oe_n === 1'b1) && (ft_rd_n === 1'b1))
+               rx_expect_release_after_rxf <= 1'b0;
          end
 
          if (prev_ft_oe_n && !ft_oe_n) begin
@@ -1846,15 +2248,15 @@ module testbench;
 
          if (dut.fifo_append) begin
             if (!rx_burst_seen) begin
-               $display("INFO: FT601 RX burst started");
+               if (TB_VERBOSE_STREAM)
+                  $display("INFO: FT601 RX burst started");
                rx_burst_seen <= 1'b1;
             end
-            if (rx_payload_check_en && dut.loopback_ctrl.service_frame_word)
-               $display("INFO: RX control frame word ignored for payload accounting, data=%h be=%h", dut.fsm_data_o, dut.fsm_be_o);
-            if (rx_payload_check_en && dut.loopback_ctrl.ft_rx_word_valid_ff && !dut.loopback_ctrl.service_frame_word && (rx_words_n < 2))
-               $display("INFO: RX sample[%0d] data=%h be=%h", rx_words_n, dut.loopback_ctrl.ft_rx_word_ff[DATA_LEN-1:0], dut.loopback_ctrl.ft_rx_word_ff[FIFO_RX_LEN-1:DATA_LEN]);
-            if (rx_payload_check_en && dut.loopback_ctrl.ft_rx_word_valid_ff && !dut.loopback_ctrl.service_frame_word) begin
-               expect_rx_word(rx_words_n, dut.loopback_ctrl.ft_rx_word_ff[DATA_LEN-1:0], dut.loopback_ctrl.ft_rx_word_ff[FIFO_RX_LEN-1:DATA_LEN]);
+            if (rx_payload_check_en && dut.loop_fifo_wen && (rx_words_n < 2))
+               if (TB_VERBOSE_STREAM)
+                  $display("INFO: RX sample[%0d] data=%h be=%h", rx_words_n, dut.loop_fifo_wdata[DATA_LEN-1:0], dut.loop_fifo_wdata[FIFO_RX_LEN-1:DATA_LEN]);
+            if (rx_payload_check_en && dut.loop_fifo_wen) begin
+               expect_rx_word(rx_words_n, dut.loop_fifo_wdata[DATA_LEN-1:0], dut.loop_fifo_wdata[FIFO_RX_LEN-1:DATA_LEN]);
                rx_words_n <= rx_words_n + 1;
             end
          end
@@ -1863,24 +2265,26 @@ module testbench;
             if (host_drive_en)
                fail("DATA/BE bus contention during FT601 TX");
             if (!tx_burst_seen) begin
-               $display("INFO: FT601 TX burst started");
+               if (TB_VERBOSE_STREAM)
+                  $display("INFO: FT601 TX burst started");
                tx_burst_seen <= 1'b1;
             end
-            if (dut.status_source_sel) begin
+            if (tx_total_words_n < TX_CAPTURE_WORDS_MAX) begin
+               tx_captured_words[tx_total_words_n] <= ft_data_bus;
+               tx_captured_be[tx_total_words_n] <= ft_be_bus;
+            end
+            tx_total_words_n <= tx_total_words_n + 1;
+
+            if (tx_stream_only_mode) begin
                tx_payload_burst_seen <= 1'b0;
-               if (ft_be_bus !== FULL_BE)
-                  fail("status frame must use full BE=4'hF");
-               if (tx_status_words_n == 0)
-                  last_status_header_word <= ft_data_bus;
-               else if (tx_status_words_n == 1)
-                  last_status_word <= ft_data_bus;
-               tx_status_words_n <= tx_status_words_n + 1;
-               $display("INFO: TX status[%0d] data=%h be=%h", tx_status_words_n, ft_data_bus, ft_be_bus);
+               if (TB_VERBOSE_STREAM)
+                  $display("INFO: TX stream[%0d] data=%h be=%h", tx_total_words_n, ft_data_bus, ft_be_bus);
             end
             else begin
                tx_payload_burst_seen <= 1'b1;
                if (tx_words_n < 2) begin
-                  $display("INFO: TX sample[%0d] data=%h be=%h", tx_words_n, ft_data_bus, ft_be_bus);
+                  if (TB_VERBOSE_STREAM)
+                     $display("INFO: TX sample[%0d] data=%h be=%h", tx_words_n, ft_data_bus, ft_be_bus);
                end
                expect_tx_word(tx_words_n, ft_data_bus, ft_be_bus);
                tx_words_n <= tx_words_n + 1;
@@ -1942,6 +2346,8 @@ module testbench;
          tx_release_events_n   <= 0;
       end
       else begin
+         #TB_POSEDGE_SAMPLE_DELAY;
+
          if (rx_oe_assert_wait) begin
             if (!ft_oe_n) begin
                rx_oe_assert_wait <= 1'b0;
@@ -1949,7 +2355,10 @@ module testbench;
                rx_oe_assert_events_n <= rx_oe_assert_events_n + 1;
                if (rx_oe_assert_cycles_cur > rx_oe_assert_cycles_max)
                   rx_oe_assert_cycles_max <= rx_oe_assert_cycles_cur;
-               $display("INFO: RXF_N active to OE_N active latency = %0d FT clocks", rx_oe_assert_cycles_cur + 1);
+               if ((exp_rx_oe_assert_cycles >= 0) && (rx_oe_assert_cycles_cur !== exp_rx_oe_assert_cycles))
+                  fail("RXF_N active to OE_N active latency mismatch");
+               if (TB_VERBOSE_LATENCY)
+                  $display("INFO: RXF_N active to OE_N active latency = %0d FT clocks", rx_oe_assert_cycles_cur);
             end
             else
                rx_oe_assert_cycles_cur <= rx_oe_assert_cycles_cur + 1;
@@ -1962,7 +2371,10 @@ module testbench;
                rx_rd_assert_events_n <= rx_rd_assert_events_n + 1;
                if (rx_rd_assert_cycles_cur > rx_rd_assert_cycles_max)
                   rx_rd_assert_cycles_max <= rx_rd_assert_cycles_cur;
-               $display("INFO: RXF_N active to RD_N active latency = %0d FT clocks", rx_rd_assert_cycles_cur + 1);
+               if ((exp_rx_rd_assert_cycles >= 0) && (rx_rd_assert_cycles_cur !== exp_rx_rd_assert_cycles))
+                  fail("RXF_N active to RD_N active latency mismatch");
+               if (TB_VERBOSE_LATENCY)
+                  $display("INFO: RXF_N active to RD_N active latency = %0d FT clocks", rx_rd_assert_cycles_cur);
             end
             else
                rx_rd_assert_cycles_cur <= rx_rd_assert_cycles_cur + 1;
@@ -1975,7 +2387,10 @@ module testbench;
                rx_oe_release_events_n <= rx_oe_release_events_n + 1;
                if (rx_oe_release_cycles_cur > rx_oe_release_cycles_max)
                   rx_oe_release_cycles_max <= rx_oe_release_cycles_cur;
-               $display("INFO: RXF_N inactive to OE_N inactive latency = %0d FT clocks", rx_oe_release_cycles_cur + 1);
+               if ((exp_rx_oe_release_cycles >= 0) && (rx_oe_release_cycles_cur !== exp_rx_oe_release_cycles))
+                  fail("RXF_N inactive to OE_N inactive latency mismatch");
+               if (TB_VERBOSE_LATENCY)
+                  $display("INFO: RXF_N inactive to OE_N inactive latency = %0d FT clocks", rx_oe_release_cycles_cur);
             end
             else
                rx_oe_release_cycles_cur <= rx_oe_release_cycles_cur + 1;
@@ -1988,7 +2403,10 @@ module testbench;
                rx_rd_release_events_n <= rx_rd_release_events_n + 1;
                if (rx_rd_release_cycles_cur > rx_rd_release_cycles_max)
                   rx_rd_release_cycles_max <= rx_rd_release_cycles_cur;
-               $display("INFO: RXF_N inactive to RD_N inactive latency = %0d FT clocks", rx_rd_release_cycles_cur + 1);
+               if ((exp_rx_rd_release_cycles >= 0) && (rx_rd_release_cycles_cur !== exp_rx_rd_release_cycles))
+                  fail("RXF_N inactive to RD_N inactive latency mismatch");
+               if (TB_VERBOSE_LATENCY)
+                  $display("INFO: RXF_N inactive to RD_N inactive latency = %0d FT clocks", rx_rd_release_cycles_cur);
             end
             else
                rx_rd_release_cycles_cur <= rx_rd_release_cycles_cur + 1;
@@ -2001,7 +2419,10 @@ module testbench;
                tx_assert_events_n   <= tx_assert_events_n + 1;
                if (tx_assert_cycles_cur > tx_assert_cycles_max)
                   tx_assert_cycles_max <= tx_assert_cycles_cur;
-               $display("INFO: TXE_N active to WR_N active latency = %0d FT clocks", tx_assert_cycles_cur + 1);
+               if ((exp_tx_assert_cycles >= 0) && (tx_assert_cycles_cur !== exp_tx_assert_cycles))
+                  fail("TXE_N active to WR_N active latency mismatch");
+               if (TB_VERBOSE_LATENCY)
+                  $display("INFO: TXE_N active to WR_N active latency = %0d FT clocks", tx_assert_cycles_cur);
             end
             else
                tx_assert_cycles_cur <= tx_assert_cycles_cur + 1;
@@ -2014,7 +2435,10 @@ module testbench;
                tx_release_events_n    <= tx_release_events_n + 1;
                if (tx_release_cycles_cur > tx_release_cycles_max)
                   tx_release_cycles_max <= tx_release_cycles_cur;
-               $display("INFO: TXE_N inactive to WR_N inactive latency = %0d FT clocks", tx_release_cycles_cur + 1);
+               if ((exp_tx_release_cycles >= 0) && (tx_release_cycles_cur !== exp_tx_release_cycles))
+                  fail("TXE_N inactive to WR_N inactive latency mismatch");
+               if (TB_VERBOSE_LATENCY)
+                  $display("INFO: TXE_N inactive to WR_N inactive latency = %0d FT clocks", tx_release_cycles_cur);
             end
             else
                tx_release_cycles_cur <= tx_release_cycles_cur + 1;
@@ -2023,68 +2447,98 @@ module testbench;
          if (prev_ft_txe_n_pos && !ft_txe_n) begin
             if (ft_wr_n) begin
                tx_assert_wait      <= 1'b1;
-               tx_assert_cycles_cur <= 0;
+               tx_assert_cycles_cur <= 1;
             end
             else begin
-               tx_assert_cycles_last <= 0;
+               tx_assert_cycles_last <= 1;
                tx_assert_events_n    <= tx_assert_events_n + 1;
-               $display("INFO: TXE_N active to WR_N active latency = 1 FT clock");
+               if (tx_assert_cycles_max < 1)
+                  tx_assert_cycles_max <= 1;
+               if ((exp_tx_assert_cycles >= 0) && (1 !== exp_tx_assert_cycles))
+                  fail("TXE_N active to WR_N active latency mismatch");
+               if (TB_VERBOSE_LATENCY)
+                  $display("INFO: TXE_N active to WR_N active latency = 1 FT clocks");
             end
          end
 
          if (!prev_ft_txe_n_pos && ft_txe_n) begin
             if (!ft_wr_n) begin
                tx_release_wait      <= 1'b1;
-               tx_release_cycles_cur <= 0;
+               tx_release_cycles_cur <= 1;
             end
             else begin
-               tx_release_cycles_last <= 0;
+               tx_release_cycles_last <= 1;
                tx_release_events_n    <= tx_release_events_n + 1;
-               $display("INFO: TXE_N inactive to WR_N inactive latency = 1 FT clock");
+               if (tx_release_cycles_max < 1)
+                  tx_release_cycles_max <= 1;
+               if ((exp_tx_release_cycles >= 0) && (1 !== exp_tx_release_cycles))
+                  fail("TXE_N inactive to WR_N inactive latency mismatch");
+               if (TB_VERBOSE_LATENCY)
+                  $display("INFO: TXE_N inactive to WR_N inactive latency = 1 FT clocks");
             end
          end
 
          if (prev_ft_rxf_n_pos && !ft_rxf_n) begin
             if (ft_oe_n) begin
                rx_oe_assert_wait <= 1'b1;
-               rx_oe_assert_cycles_cur <= 0;
+               rx_oe_assert_cycles_cur <= 1;
             end
             else begin
-               rx_oe_assert_cycles_last <= 0;
+               rx_oe_assert_cycles_last <= 1;
                rx_oe_assert_events_n <= rx_oe_assert_events_n + 1;
-               $display("INFO: RXF_N active to OE_N active latency = 1 FT clock");
+               if (rx_oe_assert_cycles_max < 1)
+                  rx_oe_assert_cycles_max <= 1;
+               if ((exp_rx_oe_assert_cycles >= 0) && (1 !== exp_rx_oe_assert_cycles))
+                  fail("RXF_N active to OE_N active latency mismatch");
+               if (TB_VERBOSE_LATENCY)
+                  $display("INFO: RXF_N active to OE_N active latency = 1 FT clocks");
             end
 
             if (ft_rd_n) begin
                rx_rd_assert_wait <= 1'b1;
-               rx_rd_assert_cycles_cur <= 0;
+               rx_rd_assert_cycles_cur <= 1;
             end
             else begin
-               rx_rd_assert_cycles_last <= 0;
+               rx_rd_assert_cycles_last <= 1;
                rx_rd_assert_events_n <= rx_rd_assert_events_n + 1;
-               $display("INFO: RXF_N active to RD_N active latency = 1 FT clock");
+               if (rx_rd_assert_cycles_max < 1)
+                  rx_rd_assert_cycles_max <= 1;
+               if ((exp_rx_rd_assert_cycles >= 0) && (1 !== exp_rx_rd_assert_cycles))
+                  fail("RXF_N active to RD_N active latency mismatch");
+               if (TB_VERBOSE_LATENCY)
+                  $display("INFO: RXF_N active to RD_N active latency = 1 FT clocks");
             end
          end
 
          if (!prev_ft_rxf_n_pos && ft_rxf_n) begin
             if (!ft_oe_n) begin
                rx_oe_release_wait <= 1'b1;
-               rx_oe_release_cycles_cur <= 0;
+               rx_oe_release_cycles_cur <= 1;
             end
             else begin
-               rx_oe_release_cycles_last <= 0;
+               rx_oe_release_cycles_last <= 1;
                rx_oe_release_events_n <= rx_oe_release_events_n + 1;
-               $display("INFO: RXF_N inactive to OE_N inactive latency = 1 FT clock");
+               if (rx_oe_release_cycles_max < 1)
+                  rx_oe_release_cycles_max <= 1;
+               if ((exp_rx_oe_release_cycles >= 0) && (1 !== exp_rx_oe_release_cycles))
+                  fail("RXF_N inactive to OE_N inactive latency mismatch");
+               if (TB_VERBOSE_LATENCY)
+                  $display("INFO: RXF_N inactive to OE_N inactive latency = 1 FT clocks");
             end
 
             if (!ft_rd_n) begin
                rx_rd_release_wait <= 1'b1;
-               rx_rd_release_cycles_cur <= 0;
+               rx_rd_release_cycles_cur <= 1;
             end
             else begin
-               rx_rd_release_cycles_last <= 0;
+               rx_rd_release_cycles_last <= 1;
                rx_rd_release_events_n <= rx_rd_release_events_n + 1;
-               $display("INFO: RXF_N inactive to RD_N inactive latency = 1 FT clock");
+               if (rx_rd_release_cycles_max < 1)
+                  rx_rd_release_cycles_max <= 1;
+               if ((exp_rx_rd_release_cycles >= 0) && (1 !== exp_rx_rd_release_cycles))
+                  fail("RXF_N inactive to RD_N inactive latency mismatch");
+               if (TB_VERBOSE_LATENCY)
+                  $display("INFO: RXF_N inactive to RD_N inactive latency = 1 FT clocks");
             end
          end
 
@@ -2100,26 +2554,45 @@ module testbench;
 
       tb_reset();
       clear_monitors();
-      test_soft_clear_tx_path();
+      scenario_start("test_tx_recovery_clear_path");
+      test_tx_recovery_clear_path();
+      scenario_end("test_tx_recovery_clear_path");
 
       tb_reset();
       clear_monitors();
       if (dut.loopback_mode_ft !== 1'b0)
          fail("Design must start in normal mode after reset");
 
-      test_soft_clear_rx_path();
-      test_soft_clear_ft_state_rx();
+      scenario_start("test_rx_recovery_clear_path");
+      test_rx_recovery_clear_path();
+      scenario_end("test_rx_recovery_clear_path");
+      scenario_start("test_ft_state_clear_rx");
+      test_ft_state_clear_rx();
+      scenario_end("test_ft_state_clear_rx");
 
-      test_soft_clear_ft_state_tx();
+      scenario_start("test_ft_state_clear_tx");
+      test_ft_state_clear_tx();
+      scenario_end("test_ft_state_clear_tx");
 
       tb_reset();
       clear_monitors();
       if (dut.loopback_mode_ft !== 1'b0)
          fail("Design must stay in normal mode before CMD_CLR_TX_ERROR recovery test");
+      scenario_start("test_cmd_clear_tx_recovery");
       test_cmd_clear_tx_recovery();
+      scenario_end("test_cmd_clear_tx_recovery");
 
+      tb_reset();
       clear_monitors();
+      scenario_start("test_cmd_reset_ft_state_keeps_tx_fifo");
+      test_cmd_reset_ft_state_keeps_tx_fifo();
+      scenario_end("test_cmd_reset_ft_state_keeps_tx_fifo");
+
+      tb_reset();
+      clear_monitors();
+      scenario_start("test_gpio_mode");
       test_gpio_mode();
+      scenario_end("test_gpio_mode");
 
       @(posedge ft_clk);
       ft_set_txe_now(1'b1);
@@ -2127,45 +2600,81 @@ module testbench;
 
       clear_monitors();
       enter_loopback_mode();
+      scenario_start("test_cmd_clear_rx_recovery");
       test_cmd_clear_rx_recovery();
+      scenario_end("test_cmd_clear_rx_recovery");
+      scenario_start("test_cmd_clear_all_recovery");
       test_cmd_clear_all_recovery();
+      scenario_end("test_cmd_clear_all_recovery");
 
       tb_reset();
       clear_monitors();
+      scenario_start("test_mode_switch_normal_to_loopback");
       test_mode_switch_normal_to_loopback();
+      scenario_end("test_mode_switch_normal_to_loopback");
+      scenario_start("test_mode_switch_loopback_to_normal");
       test_mode_switch_loopback_to_normal();
+      scenario_end("test_mode_switch_loopback_to_normal");
 
       tb_reset();
       clear_monitors();
+      scenario_start("test_mode_switch_after_recent_tx_burst");
       test_mode_switch_after_recent_tx_burst();
+      scenario_end("test_mode_switch_after_recent_tx_burst");
 
       tb_reset();
       clear_monitors();
+      scenario_start("test_get_status_normal_mode");
       test_get_status_normal_mode();
+      scenario_end("test_get_status_normal_mode");
 
       tb_reset();
       clear_monitors();
+      scenario_start("test_get_status_after_clear");
       test_get_status_after_clear();
+      scenario_end("test_get_status_after_clear");
 
       tb_reset();
       clear_monitors();
+      scenario_start("test_get_status_with_pending_normal_tx");
       test_get_status_with_pending_normal_tx();
+      scenario_end("test_get_status_with_pending_normal_tx");
 
       tb_reset();
       clear_monitors();
       enter_loopback_mode();
       clear_monitors();
+      scenario_start("test_get_status_loopback_mode");
       test_get_status_loopback_mode();
+      scenario_end("test_get_status_loopback_mode");
       clear_monitors();
+      scenario_start("test_get_status_with_pending_loopback_tx");
+      test_get_status_with_pending_loopback_tx();
+      scenario_end("test_get_status_with_pending_loopback_tx");
+      clear_monitors();
+      scenario_start("test_opcode_without_magic_is_payload");
       test_opcode_without_magic_is_payload();
+      scenario_end("test_opcode_without_magic_is_payload");
       enter_normal_mode();
       enter_loopback_mode();
       clear_monitors();
+      scenario_start("test_unknown_command_frame_ignored");
       test_unknown_command_frame_ignored();
+      scenario_end("test_unknown_command_frame_ignored");
       clear_monitors();
+      scenario_start("test_loopback_mode");
       test_loopback_mode();
+      scenario_end("test_loopback_mode");
 
+      scenario_start("test_fpga_reset_drives_ft601_reset");
+      test_fpga_reset_drives_ft601_reset();
+      scenario_end("test_fpga_reset_drives_ft601_reset");
+
+      enter_loopback_mode();
+
+      scenario_start("pulse_fpga_reset_only");
       pulse_fpga_reset_only();
+      scenario_end("pulse_fpga_reset_only");
 
       $display("TEST PASSED. Universal bitstream flow verified, words=%0d", exp_words_n);
       $finish;

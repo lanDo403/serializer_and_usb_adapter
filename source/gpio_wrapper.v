@@ -1,6 +1,6 @@
 `timescale 1ns / 1ps
 
-module get_gpio #(
+module gpio_wrapper #(
 	parameter GPIO_LEN = 8
 )(
 	input clk_i,

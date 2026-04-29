@@ -1,21 +1,19 @@
 `timescale 1ns / 1ps
 
-module fifo_singleclock #(
+module loopback_fifo #(
 	parameter DATA_LEN = 32,
 	parameter DEPTH = 8192,
 	parameter ADDR_LEN = $clog2(DEPTH)
 )(
 	input                    clk,
 	input                    rst_n,
-	input                    soft_clear_i,
+	input                    clear_i,
 	input                    wen_i,
 	input                    ren_i,
 	input  [DATA_LEN-1:0]    data_i,
 	output [DATA_LEN-1:0]    data_o,
 	output                   full,
-	output                   empty,
-	output                   overflow,
-	output                   underflow
+	output                   empty
 );
 
 	reg [DATA_LEN-1:0] mem [0:DEPTH-1];
@@ -24,8 +22,6 @@ module fifo_singleclock #(
 	reg [ADDR_LEN:0] rd_ptr_ff;
 	reg full_ff;
 	reg empty_ff;
-	reg overflow_ff;
-	reg underflow_ff;
 
 	wire wen_do;
 	wire ren_do;
@@ -50,7 +46,7 @@ module fifo_singleclock #(
 			full_ff <= 1'b0;
 			empty_ff <= 1'b1;
 		end
-		else if (soft_clear_i) begin
+		else if (clear_i) begin
 			wr_ptr_ff <= {ADDR_LEN+1{1'b0}};
 			rd_ptr_ff <= {ADDR_LEN+1{1'b0}};
 			full_ff <= 1'b0;
@@ -69,7 +65,7 @@ module fifo_singleclock #(
 		if (!rst_n) begin
 			data_ff <= {DATA_LEN{1'b0}};
 		end
-		else if (soft_clear_i) begin
+		else if (clear_i) begin
 			data_ff <= {DATA_LEN{1'b0}};
 		end
 		else begin
@@ -80,30 +76,8 @@ module fifo_singleclock #(
 		end
 	end
 
-	// Overflow is sticky until reset or soft clear.
-	always @(posedge clk) begin
-		if (!rst_n)
-			overflow_ff <= 1'b0;
-		else if (soft_clear_i)
-			overflow_ff <= 1'b0;
-		else if (wen_i && full_ff)
-			overflow_ff <= 1'b1;
-	end
-
-	// Underflow is sticky until reset or soft clear.
-	always @(posedge clk) begin
-		if (!rst_n)
-			underflow_ff <= 1'b0;
-		else if (soft_clear_i)
-			underflow_ff <= 1'b0;
-		else if (ren_i && empty_ff)
-			underflow_ff <= 1'b1;
-	end
-
 	assign data_o = data_ff;
 	assign full = full_ff;
 	assign empty = empty_ff;
-	assign overflow = overflow_ff;
-	assign underflow = underflow_ff;
 
 endmodule

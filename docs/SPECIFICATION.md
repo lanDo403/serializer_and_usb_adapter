@@ -1,455 +1,159 @@
-﻿# SPECIFICATION
+# SPECIFICATION
 
-## 1. Назначение проекта
+## Назначение
 
-Проект реализует систему высокоскоростного обмена данными на базе ПЛИС `Xilinx Spartan-6` с использованием моста `FTDI FT601` в режиме `245 synchronous FIFO`.
+Проект описывает текущую RTL-архитектуру для `Xilinx Spartan-6` и `FTDI FT601` в режиме `245 synchronous FIFO`. Один bitstream поддерживает три host-visible сценария: передача GPIO-потока в ПК, возврат данных в loopback-режиме и служебный status/control обмен.
 
-Один bitstream поддерживает два режима работы:
+После полного reset система всегда стартует в `normal mode`. Дальше ПК может переключить режим через framed service protocol без перепрошивки FPGA.
 
-1. `Normal mode` — передача данных с GPIO в ПК через FT601.
-2. `FT loopback mode` — прием данных от ПК через FT601 и возврат этих же данных обратно в FT601 без участия GPIO.
+## Внешние интерфейсы
 
-## 2. Верхнеуровневые интерфейсы
+Со стороны GPIO используются `GPIO_CLK`, `GPIO_DATA[7:0]`, `GPIO_STROB` и `FPGA_RESET`. `GPIO_CLK` задает write-домен. Данные считаются валидными по `GPIO_STROB`, затем `packer8to32` собирает четыре байта в одно 32-битное слово. `FPGA_RESET` является общим внешним hard reset для проекта.
 
-### 2.1. GPIO-интерфейс
+Со стороны FT601 используются стандартные сигналы synchronous FIFO bus: `CLK`, `TXE_N`, `RXF_N`, `OE_N`, `WR_N`, `RD_N`, `RESET_N`, `DATA[31:0]` и `BE[3:0]`. `CLK` формирует FT-домен. `TXE_N=0` означает, что FT601 готов принять слово от FPGA. `RXF_N=0` означает, что FT601 имеет слово для FPGA. `WR_N=0` записывает данные в FT601, а `OE_N=0` вместе с `RD_N=0` используется для чтения.
 
-Входные сигналы:
+`RESET_N` - выход FPGA в FT601. Он active-low и управляется от `FPGA_RESET`.
 
-- `GPIO_CLK`
-- `GPIO_DATA[7:0]`
-- `GPIO_STROB`
-- `FPGA_RESET`
+## Тактовые домены и reset
 
-Назначение:
+В проекте два рабочих домена. GPIO-домен работает от `GPIO_CLK` и содержит `gpio_wrapper`, `packer8to32`, write-side `async_fifo` и `tx_write_guard`. FT-домен работает от `CLK` FT601 и содержит FT601 boundary, FSM, adapters, RX router, command decoder, status source, loopback FIFO и read-side `async_fifo`.
 
-- `GPIO_CLK` задает write-домен.
-- `GPIO_DATA[7:0]` содержит входные байты.
-- `GPIO_STROB` отмечает валидность входного байта.
-- `FPGA_RESET` сбрасывает логику FPGA и возвращает систему в `normal mode`.
+Reset устроен просто. `FPGA_RESET` приходит в `top.v`, буферизуется и используется как reset request для обоих доменов. `rst_sync` делает asynchronous assert и synchronous release отдельно для `gpio_clk` и `ft_clk_i`. Пока reset активен, FPGA держит `RESET_N=0` для FT601, управляющие сигналы `WR_N/RD_N/OE_N` неактивны, а `DATA/BE` находятся в tri-state.
 
-### 2.2. FT601-интерфейс
+После reset `service_cmd_decoder` держит `loopback_mode=0`, FIFO находятся в empty-state, status response не pending. Host-команда `CMD_RESET_FT_STATE` очищает локальное FT-domain state и recovery logic, но не является физическим reset FT601 и не очищает normal TX async FIFO.
 
-Сигналы:
+## Основная архитектура
 
-- входы от FT601:
-  - `CLK`
-  - `RESET_N`
-  - `TXE_N`
-  - `RXF_N`
-- выходы в FT601:
-  - `OE_N`
-  - `WR_N`
-  - `RD_N`
-- двунаправленные шины:
-  - `BE[3:0]`
-  - `DATA[31:0]`
+Верхний уровень находится в `source/top.v`. Он не содержит сложной последовательной логики, а соединяет домены, FIFO, FT601 adapters, stream arbiter, router и command/status блоки.
 
-Назначение:
+FT601 boundary разделен на несколько блоков. `ft601_wrapper.v` содержит физические буферы, регистрирует `TXE_N/RXF_N`, управляет IOB-регистрами и tri-state для `DATA/BE`. `ft601_fsm.v` координирует фазы доступа к FT601, но не держит весь datapath внутри одного большого блока. RX-сэмплинг вынесен в `ft601_rx_adapter.v`, TX prefetch/output pipeline - в `ft601_tx_adapter.v`.
 
-- `CLK` задает FT-домен.
-- `TXE_N` сообщает, что FT601 готов принимать данные от FPGA.
-- `RXF_N` сообщает, что FT601 содержит данные для FPGA.
-- `OE_N` и `RD_N` используются для чтения из FT601.
-- `WR_N` используется для записи в FT601.
-- `BE[3:0]` и `DATA[31:0]` образуют рабочую шину обмена.
+Для внутренней связи используется AXI-Stream-подобный стиль: `valid`, `ready`, `data`, `keep`. Это не внешний AXI IP и не SystemVerilog `interface`, а локальный контракт между модулями. Передача слова происходит при `valid && ready`. Пока `valid=1` и handshake еще не произошел, источник должен держать `data/keep` стабильными. `tlast` намеренно не вводится: границы service/status frame уже заданы магическими словами протокола.
 
-## 3. Архитектура и datapath
+Основные stream-ветки:
 
-### 3.1. Тактовые домены
+| Поток | Назначение |
+| --- | --- |
+| `normal_axis_*` | payload из normal TX FIFO |
+| `loopback_axis_*` | payload из loopback FIFO |
+| `status_axis_*` | status response source |
+| `tx_axis_*` | общий TX stream после arbitration |
+| `ft_rx_axis_*` | поток слов, принятых от FT601 |
 
-Система разделена на два домена.
+`axis_tx_arbiter.v` выбирает один TX-источник с приоритетом `status -> loopback -> normal`. Status frame должен выйти атомарно: `STATUS_MAGIC`, затем `status_word`, без payload между ними.
 
-#### GPIO domain
+`rx_stream_router.v` разделяет RX-слова от FT601 на service traffic и loopback payload. Он потребляет service frame, не пропускает его в loopback FIFO и при этом сохраняет одиночные слова без `CMD_MAGIC` как обычный payload. Это важно для сценария, где payload случайно совпал с opcode, но не был предварен magic-word.
 
-Источник такта: `GPIO_CLK`
+## Datapath режимов
 
-Функции:
+В `normal mode` данные идут от GPIO к ПК:
 
-- захват входного GPIO-потока;
-- упаковка байтов в 32-битные слова;
-- запись слов в TX FIFO.
+```text
+GPIO -> gpio_wrapper -> packer8to32 -> async_fifo -> axis_tx_arbiter -> ft601_tx_adapter -> ft601_wrapper -> FT601 -> PC
+```
 
-#### FT domain
+FT601 RX path в этом режиме остается активным для service-команд. Если включается loopback, запись новых GPIO-слов в normal TX FIFO блокируется через `tx_write_guard`.
 
-Источник такта: `CLK` от FT601
+В `FT loopback mode` данные приходят с ПК и возвращаются обратно:
 
-Функции:
+```text
+PC -> FT601 -> ft601_rx_adapter -> rx_stream_router -> loopback_fifo -> axis_tx_arbiter -> ft601_tx_adapter -> FT601 -> PC
+```
 
-- FT601 handshake;
-- чтение из FT601;
-- запись в FT601;
-- потоковая обработка команд;
-- loopback.
+Loopback FIFO хранит 36 бит на слово: `{BE[3:0], DATA[31:0]}`. Это сохраняет byte-enable информацию и не превращает неполные слова в обычный full-word payload.
 
-### 3.2. Основные блоки
+Status path работает параллельно payload path, но имеет приоритет на TX. По `CMD_GET_STATUS` блок `status_source.v` формирует двухсловный response. Если FT601 TX burst уже идет, status ждет следующего безопасного idle-window. Если payload только pending, status выходит первым.
 
-#### `source/top.v`
+## Framed service protocol
 
-Связывает оба домена, FIFO, FT601 wrapper, FSM и управляющие блоки.
+Service traffic идет по тем же endpoints, что и payload: команды по `EP02`, ответы по `EP82`. Команды больше не маркируются через особое значение `BE`. Для service/status слов ожидается полный beat, то есть `BE=4'hF`.
 
-#### `source/ft601_io.v`
+Команда состоит из двух 32-битных слов:
 
-Физическая обвязка FT601:
+```text
+CMD_MAGIC = 32'hA55A5AA5
+opcode
+```
 
-- `IBUFG` для `CLK`;
-- `IBUF` для `RESET_N`, `TXE_N`, `RXF_N`;
-- `OBUF` для `OE_N`, `WR_N`, `RD_N`;
-- `IOBUF` для `DATA[31:0]` и `BE[3:0]`.
+Parser распознает команду только после полного слова `CMD_MAGIC`. Следующее полное слово потребляется как opcode. Если opcode неизвестен, frame отбрасывается без побочных эффектов и оба слова не попадают в loopback payload.
 
-Особенность текущей реализации:
+Поддерживаемые opcode:
 
-- `TXE_N` и `RXF_N` после `IBUF` захватываются явными регистрами в домене `clk_o`;
-- наружу в остальной дизайн выходят только зарегистрированные `txe_n_o` и `rxf_n_o`;
-- эти регистры являются целевой точкой завершения timing-анализа по `OFFSET IN` для control-флагов FT601.
+| Opcode | Значение | Действие |
+| --- | --- | --- |
+| `CMD_CLR_TX_ERROR` | `32'h00000001` | очистить TX diagnostic sticky state |
+| `CMD_CLR_RX_ERROR` | `32'h00000002` | очистить RX diagnostic sticky state |
+| `CMD_CLR_ALL_ERROR` | `32'h00000003` | очистить TX и RX errors |
+| `CMD_SET_LOOPBACK` | `32'hA5A50004` | перейти в loopback mode |
+| `CMD_SET_NORMAL` | `32'hA5A50005` | вернуться в normal mode |
+| `CMD_GET_STATUS` | `32'hA5A50006` | запросить status response |
+| `CMD_RESET_FT_STATE` | `32'hA5A50007` | очистить локальное FT state без очистки normal TX FIFO |
 
-#### `source/bit_sync.v`
+Ответ на `CMD_GET_STATUS`:
 
-Локальный single-bit CDC helper.
+```text
+STATUS_MAGIC = 32'h5AA55AA5
+status_word
+```
 
-Текущее назначение:
+`status_word` остается совместимым с текущей host-утилитой:
 
-- синхронизация `loopback_mode` из FT-домена в `gpio_clk`;
-- сохранение `top.v` как чистого интеграционного модуля без собственной последовательностной CDC-логики.
+| Биты | Значение |
+| --- | --- |
+| `0` | `loopback_mode` |
+| `1` | `tx_error` |
+| `2` | `rx_error` |
+| `3` | `tx_fifo_empty` |
+| `4` | `tx_fifo_full` |
+| `5` | `loopback_fifo_empty` |
+| `6` | `loopback_fifo_full` |
+| `31:7` | `0` |
 
-#### `source/get_gpio.v`
+## Mode switch и recovery
 
-Захват GPIO-сигналов и формирование локальных write-domain сигналов.
+Переходы между `normal` и `loopback` выполняются только через command decoder. Декодер не меняет режим мгновенно в середине активного TX. Он выставляет `service_hold`, дожидается безопасного idle состояния, очищает локальные FT/RX/TX adapter state, при необходимости flush-ит TX prefetch и только потом фиксирует новый режим.
 
-#### `source/packer8to32.v`
+`service_hold` не является reset. Он просто блокирует новые операции на время controlled switch. `tx_flush` очищает pending TX adapter word. Recovery clear очищает диагностическое состояние и соответствующие FIFO/recovery paths. Эти операции разведены по смыслу, чтобы не маскировать ошибки и не очищать лишние данные.
 
-Упаковка четырех валидных байтов в одно 32-битное слово.
+## Диагностика
 
-#### `source/fifo_dualport.v` + `source/sram_dualport.v`
+Внешний статус пока содержит только агрегированные `tx_error` и `rx_error`. Внутри они строятся не на декоративных FIFO sticky flags, а на реальных событиях подсистем:
 
-Асинхронный TX FIFO между GPIO domain и FT domain.
+| Агрегат | События |
+| --- | --- |
+| `tx_error` | write request в full normal TX FIFO, read request из empty normal TX FIFO |
+| `rx_error` | write request в full loopback FIFO, read request из empty loopback FIFO |
 
-Назначение:
+Команды `CMD_CLR_TX_ERROR`, `CMD_CLR_RX_ERROR` и `CMD_CLR_ALL_ERROR` очищают эти sticky-состояния. Формат `status_word` от этого не расширяется.
 
-- буферизация основного потока `GPIO -> FT601`;
-- раздельные такты записи и чтения;
-- фиксация `overflow` и `underflow`.
+## FT601 handshake и timing
 
-#### `source/fifo_singleclock.v`
+Текущая архитектура не обязана повторять latency из FTDI master FIFO reference. Значения `3/4/1` были характеристикой reference-дизайна, а не жестким требованием этого проекта.
 
-Single-clock FIFO в домене `ft_clk_i` для loopback.
+Обязательные требования другие. Нельзя строить combinational direct path от `TXE_N/RXF_N` pad к `WR_N/RD_N/OE_N`. `WR_N` и `drive_tx` должны оставаться независимыми сигналами. При TX backpressure нельзя терять, дублировать или переставлять слова. Во время active write шины `DATA/BE` должны быть стабильны, а во время RX и reset FPGA не должна драйвить FT601 data bus.
 
-Формат хранения:
+Желательно сохранять хотя бы один FT clock latency между изменением `TXE_N/RXF_N` и активностью соответствующих control-сигналов. Но главным критерием остается корректный handshake, отсутствие underflow/overflow в штатных сценариях и прохождение timing constraints.
 
-- ширина слова `36` бит;
-- формат `{BE, DATA}`.
+## Проверка
 
-Loopback FIFO не хранит только `DATA[31:0]`, так как `BE` должен сохраняться вместе с payload.
+Основной самопроверочный стенд - `source/testbench.v`. Он должен подтверждать reset, `normal mode`, runtime-вход в loopback, возврат в normal, status frame, recovery commands, backpressure и отсутствие смешивания service traffic с payload.
 
-#### `source/loopback_ft_ctrl.v`
+Обязательные локальные команды:
 
-FT-domain блок локального runtime-управления loopback-путем.
+```powershell
+cd C:\Users\userIvan\Desktop\my_projects\logic_analyzer\source
+iverilog -g2005-sv -o testbench.out testbench.v
+vvp .\testbench.out
+$env:VERILATOR_ROOT='C:\msys64\mingw64\share\verilator'
+verilator_bin.exe --lint-only --timing testbench.v
+```
 
-Текущее назначение:
+После timing-sensitive RTL-изменений нужен ISE flow. Минимум - `xst -ifn top.xst -ofn top.syr`. Для окончательного решения по частоте смотреть post-PAR отчеты `top.twr` и `top.twx`, а не только synthesis estimate.
 
-- регистрация принятых RX-слов `{BE, DATA}`;
-- отделение командного слова от loopback payload при входе в loopback;
-- формирование записи в `loopback_fifo`;
-- генерация `tx_prefetch_en` и `tx_source_change` для `fifo_fsm`.
+Host-side проверка выполняется через `ft601_test`. Базовый сценарий: `GET_STATUS`, `SET_LOOPBACK`, `Loopback integrity test`, `SET_NORMAL`, `CLR_ALL_ERROR`, снова `GET_STATUS`. Если loopback исправен, отправленный payload должен совпасть с принятым слово в слово.
 
-#### `source/host_cmd_ctrl.v`
+## Исходники, которые входят в текущую архитектуру
 
-Потоковый декодер слов, пришедших с FT601.
+Ключевые RTL-файлы: `top.v`, `ft601_wrapper.v`, `ft601_fsm.v`, `ft601_rx_adapter.v`, `ft601_tx_adapter.v`, `axis_tx_arbiter.v`, `rx_stream_router.v`, `service_cmd_decoder.v`, `status_source.v`, `async_fifo.v`, `loopback_fifo.v`, `sram_dualport.v`, `tx_write_guard.v`, `gpio_wrapper.v`, `packer8to32.v`, `rst_sync.v`, `bit_sync.v`, `pulse_sync.v`.
 
-Текущее назначение:
-
-- обработка служебных RX-frame в обоих режимах;
-- фиксация и очистка sticky-ошибок;
-- включение runtime loopback режима.
-
-RX-команды больше не обязаны проходить через отдельный async RX FIFO: они обрабатываются потоково по принятым словам в FT-домене.
-
-#### `source/status_ft_ctrl.v`
-
-FT-domain источник статусного ответного слова.
-
-Текущее назначение:
-
-- формирование двухсловного TX status frame по `CMD_GET_STATUS`;
-- выдача `STATUS_MAGIC` и `status_word` через FT601 TX path;
-- запуск ответа только в безопасном окне, когда внутренний TX pipeline свободен.
-
-#### `source/tx_write_guard.v`
-
-Управление записью в TX FIFO со стороны GPIO domain.
-
-Функции:
-
-- разрешение записи packed-слов в TX FIFO;
-- блокировка приема новых GPIO-слов после sticky-ошибки;
-- очистка TX error по команде от хоста.
-
-#### `source/fifo_fsm.v`
-
-FSM FT601-интерфейса.
-
-Функции:
-
-- арбитраж между RX и TX;
-- генерация `WR_N`, `RD_N`, `OE_N`;
-- управление `drive_tx`;
-- формирование `fifo_pop` и `fifo_append`;
-- burst-чтение и burst-запись.
-
-Текущие состояния:
-
-- `ARB`
-- `TX_PREFETCH`
-- `TX_BURST`
-- `RX_START`
-- `RX_BURST`
-
-### 3.3. Текущий рабочий datapath
-
-#### Normal mode
-
-`GPIO -> get_gpio -> packer8to32 -> fifo_tx -> fifo_fsm -> FT601 -> PC`
-
-Особенности:
-
-- полезные данные приходят с GPIO;
-- FT601 RX path используется только для служебных команд;
-- запись из GPIO в TX FIFO блокируется при активном loopback режиме.
-
-#### FT loopback mode
-
-`PC -> FT601 -> fifo_fsm -> loopback_ft_ctrl -> loopback_fifo -> fifo_fsm -> FT601 -> PC`
-
-Особенности:
-
-- payload принимается через обычный FT601 RX handshake;
-- принятое слово сразу фиксируется как `{BE, DATA}`;
-- слово пишется в `loopback_fifo`;
-- затем тот же payload возвращается в FT601 TX path;
-- GPIO путь на время loopback не используется как источник данных для FT601 TX.
-
-## 4. Режимы работы
-
-### 4.1. Normal mode
-
-Это режим по умолчанию после reset.
-
-Поведение:
-
-1. Данные приходят с GPIO.
-2. Каждые 4 валидных байта упаковываются в 32-битное слово.
-3. Слова записываются в TX FIFO.
-4. При активном `TXE_N = 0` FT601 принимает эти слова от FPGA.
-5. RX-слова, пришедшие с FT601, трактуются как командный поток.
-
-### 4.2. FT loopback mode
-
-Loopback включается во время работы без перепрошивки.
-
-Способ входа:
-
-- команда `32'hA5A50004`, принятая через FT601 RX path;
-- команда передается как framed service protocol: сначала `CMD_MAGIC = 32'hA55A5AA5`, затем `opcode = 32'hA5A50004`, оба слова с полным `BE = 4'hF`.
-
-Поведение:
-
-1. ПК отправляет 32-битные слова в FT601.
-2. FPGA принимает их через FT601 RX handshake.
-3. Слова записываются в `loopback_fifo` как `{BE, DATA}`.
-4. Далее те же слова выдаются обратно через FT601 TX path.
-5. Обычные RX-слова рассматриваются как payload, а `control frame` продолжает трактоваться как служебная последовательность слов и не попадает в payload.
-
-### 4.3. Выход из loopback mode
-
-Штатный выход выполняется командой `32'hA5A50005`, принятой через FT601 RX path как `control frame`.
-
-После этого система обязана:
-
-1. запретить старт новых локальных операций;
-2. дождаться безопасного idle-окна FT-domain;
-3. локально очистить FIFO и внутренний state;
-4. вернуться в `normal mode`;
-5. снова разрешить путь `GPIO -> TX FIFO -> FT601`.
-
-`FPGA_RESET` остается полным глобальным reset и тоже возвращает систему в `normal mode`.
-
-## 5. Командный протокол
-
-Командный поток идет через framed service protocol и должен распознаваться в обоих режимах.
-
-Команда считается принятой, если:
-
-1. пришло полное слово `CMD_MAGIC = 32'hA55A5AA5` с `BE = 4'hF`;
-2. следующее полное слово с `BE = 4'hF` трактуется как `opcode`;
-3. `opcode` совпадает с одним из поддерживаемых кодов.
-
-### 5.1. Поддерживаемые команды
-
-- `32'hA55A5AA5` — `CMD_MAGIC`, первый beat любого service-command frame;
-- `32'h00000001` — очистить TX error;
-- `32'h00000002` — очистить RX error;
-- `32'h00000003` — очистить обе ошибки;
-- `32'hA5A50004` — включить loopback mode.
-- `32'hA5A50005` — вернуть `normal mode`.
-- `32'hA5A50006` — запросить статусный ответ.
-- `32'h5AA55AA5` — `STATUS_MAGIC`, первый beat любого status response frame.
-
-### 5.2. Ограничения по loopback-команде
-
-1. Команда включения loopback должна быть принята через обычный FT601 RX handshake.
-2. Оба слова command frame не должны попасть в loopback payload.
-3. После входа в loopback обычные RX-слова трактуются как payload, а `control frame` остается служебной последовательностью слов.
-
-### 5.3. Статусный ответ
-
-На `CMD_GET_STATUS` FPGA должна вернуть двухсловный TX status frame:
-
-1. `STATUS_MAGIC = 32'h5AA55AA5`
-2. `status_word`
-
-Оба слова должны передаваться как полные 32-битные beat с `BE = 4'hF`.
-
-Формат `status_word`:
-
-- `bit[0]` — `loopback_mode`
-- `bit[1]` — `tx_error`
-- `bit[2]` — `rx_error`
-- `bit[3]` — `tx_fifo_empty`
-- `bit[4]` — `tx_fifo_full`
-- `bit[5]` — `loopback_fifo_empty`
-- `bit[6]` — `loopback_fifo_full`
-- `bit[31:7]` — `0`
-
-## 6. Сброс
-
-### 6.1. Внешние сигналы сброса
-
-- `FPGA_RESET` — внешний сброс со стороны платы;
-- `RESET_N` — active-low reset от FT601.
-
-### 6.2. Внутренние требования
-
-1. Внутренняя логика использует synchronized active-low reset по доменам.
-2. После `FPGA_RESET` система обязана вернуться в `normal mode`.
-3. Во время reset управляющие выходы FT601 должны быть неактивны:
-   - `WR_N = 1`
-   - `RD_N = 1`
-   - `OE_N = 1`
-4. Во время reset FPGA не должна драйвить FT601 data bus.
-
-## 7. Timing и handshake требования
-
-### 7.1. FT601 control-флаги
-
-Внутри дизайна должны использоваться только зарегистрированные версии `TXE_N` и `RXF_N`.
-
-Требования:
-
-- сырые сигналы после `IBUF` не должны использоваться вне `ft601_io`;
-- timing-анализ control-флагов должен завершаться на входных регистрах FT-домена;
-- `WR_N` и `drive_tx` должны быть независимыми сигналами;
-- `drive_tx` не должен быть простой инверсией `WR_N`.
-
-### 7.2. RX временная диаграмма
-
-Целевая фазировка FT601 RX path:
-
-- `RXF_N active -> OE_N active = 3 FT clocks`;
-- `RXF_N active -> RD_N active = 4 FT clocks`;
-- `RXF_N inactive -> OE_N inactive = 1 FT clock`;
-- `RXF_N inactive -> RD_N inactive = 1 FT clock`.
-
-Дополнительные требования:
-
-- `OE_N` должен активироваться раньше `RD_N`;
-- после снятия `RXF_N` сигналы `OE_N` и `RD_N` должны отпускаться с корректной фазировкой;
-- RX payload должен приниматься без потери первого слова и без лишнего append в конце burst.
-
-### 7.3. TX временная диаграмма
-
-Целевая фазировка FT601 TX path:
-
-- `TXE_N active -> WR_N active = 3 FT clocks`;
-- `TXE_N inactive -> WR_N inactive = 1 FT clock`.
-
-Дополнительные требования:
-
-- внутри burst `WR_N` не должен пульсировать на каждом слове;
-- пока `TXE_N` остается активным и данные доступны, burst должен идти непрерывно;
-- при backpressure со стороны FT601 burst должен корректно останавливаться и продолжаться без потери порядка слов;
-- TX datapath не должен повторно выдавать предыдущее слово при обновлении burst.
-
-## 8. Ошибки и защита
-
-Используются sticky-ошибки.
-
-### 8.1. TX error
-
-Фиксируется при:
-
-- попытке записи в полный TX FIFO;
-- TX-side underflow, если такой сценарий зарегистрирован логикой FIFO.
-
-### 8.2. RX error
-
-Фиксируется при:
-
-- overflow loopback FIFO;
-- underflow loopback FIFO;
-- других RX-side ошибках, если они зарегистрированы логикой FIFO.
-
-### 8.3. Очистка ошибок
-
-Ошибки очищаются командами от хоста через FT601 RX path в виде `control frame`.
-
-## 9. Verification requirements
-
-Основной проверочный стенд: `source/testbench.v`.
-
-Testbench должен покрывать:
-
-1. reset sequence;
-2. старт в `normal mode` после reset;
-3. normal mode: `GPIO -> FT601`;
-4. подтверждение, что TX не стартует при `TXE_N = 1`;
-5. backpressure на TX path;
-6. команду входа в loopback;
-7. loopback mode: `FT601 -> FPGA -> FT601`;
-8. возврат в `normal mode` по `CMD_SET_NORMAL`;
-9. возврат в `normal mode` по `FPGA_RESET`;
-10. `CMD_GET_STATUS` в `normal mode`;
-11. `CMD_GET_STATUS` в `loopback mode`;
-12. `CMD_GET_STATUS` после recovery-команд;
-13. `opcode` без `CMD_MAGIC` не считается командой;
-14. `CMD_MAGIC + unknown opcode` не меняет состояние и не попадает в payload;
-15. корректность RX и TX данных;
-16. фазировку FT601 RX/TX handshake;
-17. количественное измерение RX и TX latency.
-
-Stimulus для GPIO и loopback берется из `source/data_p`.
-
-## 10. Файлы реализации
-
-Основные HDL-файлы:
-
-- `source/top.v`
-- `source/ft601_io.v`
-- `source/rst_sync.v`
-- `source/get_gpio.v`
-- `source/packer8to32.v`
-- `source/fifo_dualport.v`
-- `source/fifo_singleclock.v`
-- `source/sram_dualport.v`
-- `source/fifo_fsm.v`
-- `source/tx_write_guard.v`
-- `source/host_cmd_ctrl.v`
-- `source/status_ft_ctrl.v`
-- `source/testbench.v`
-
-Файл ограничений:
-
-- `source/callistoS6.ucf`
-
-Материалы reference и datasheet:
-
-- `docs/`
-
+Ограничения лежат в `source/callistoS6.ucf`. Testbench - `source/testbench.v`. Host-side проверка - в `ft601_test/`.

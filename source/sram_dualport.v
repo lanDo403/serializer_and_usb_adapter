@@ -10,7 +10,6 @@ module sram_dp
 	input							wr_clk,
 	input 						rd_clk,
 	input 						wen,
-	input 						ren,
 	input [ADDR_LEN-1:0] 	wr_addr,
 	input [ADDR_LEN-1:0] 	rd_addr,
 	input [DATA_LEN-1:0]  	data_i,
@@ -26,8 +25,7 @@ module sram_dp
 	end
 	
 	always @(posedge rd_clk) begin
-		if (ren)
-			ram_data_ff <= sram[rd_addr];
+		ram_data_ff <= sram[rd_addr];
 	end
 	
 	assign data_o = ram_data_ff;
