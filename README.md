@@ -81,7 +81,7 @@ status_word
 
 `source/` содержит RTL, testbench и constraints. Главная точка входа - `source/top.v`. Физическая граница FT601 находится в `ft601_wrapper.v`, а read/write handshake разбит между `ft601_fsm.v`, `ft601_rx_adapter.v` и `ft601_tx_adapter.v`. Выбор TX-источника делает `axis_tx_arbiter.v`, RX service/payload path разделяет `rx_stream_router.v`, а команды разбирает `service_cmd_decoder.v`.
 
-`docs/` содержит спецификацию и справочные материалы. Если нужно понять точные требования к протоколу, reset, handshake и проверкам, лучше начинать с `docs/SPECIFICATION.md`.
+`SPECIFICATION.md` содержит актуальное техническое описание протокола, reset-системы, FT601 handshake, datapath и проверок.
 
 `ft601_test/` - консольная C++ утилита для ручной проверки с ПК через D3XX API. Код разделен по смыслу: `main.cpp` содержит меню, `ft601_device.*` работает с D3XX и pipe, `service_protocol.*` отправляет команды и читает статус, `payload_test.*` генерирует payload и делает loopback compare.
 
@@ -109,4 +109,4 @@ Raw-операции `Write test payload` и `Read payload to file` остают
 
 ## Куда смотреть дальше
 
-Для быстрого входа достаточно трех файлов: `source/top.v`, `docs/SPECIFICATION.md` и `ft601_test/README.md`. Если нужно отлаживать FT601 handshake, рядом почти всегда понадобятся `ft601_wrapper.v`, `ft601_fsm.v`, `ft601_rx_adapter.v`, `ft601_tx_adapter.v` и waveform из `source/testbench.vcd`.
+Для быстрого входа достаточно трех файлов: `source/top.v`, `SPECIFICATION.md` и `ft601_test/README.md`. Если нужно отлаживать FT601 handshake, рядом почти всегда понадобятся `ft601_wrapper.v`, `ft601_fsm.v`, `ft601_rx_adapter.v`, `ft601_tx_adapter.v` и waveform из `source/testbench.vcd`.
