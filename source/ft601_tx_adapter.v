@@ -34,7 +34,6 @@ module ft601_tx_adapter #(
 	reg [BE_LEN-1:0]   lookahead_keep_ff;
 	reg word_valid_ff;
 	reg lookahead_valid_ff;
-	reg s_fire_pending_ff;
 	reg prefetch_en_ff;
 	reg source_ready_ff;
 	reg bus_drive_ff;
@@ -57,12 +56,9 @@ module ft601_tx_adapter #(
 	assign write_req_w = !txe_n_i && word_valid_ff;
 	assign source_ready_w = status_source_i || !txe_n_i;
 	assign buffer_used_w = {1'b0, word_valid_ff} +
-	                       {1'b0, lookahead_valid_ff} +
-	                       {1'b0, s_fire_pending_ff};
+	                       {1'b0, lookahead_valid_ff};
 	assign buffer_ready_w = (buffer_used_w < 2'd2) || write_fire_w;
-	assign s_fire_w = !hold_i && prefetch_en_ff &&
-	                  source_ready_ff && s_valid_i &&
-	                  buffer_ready_w;
+	assign s_fire_w = s_valid_i && s_ready_o;
 
 	// One output word plus one lookahead word are enough for continuous FT601 TX bursts.
 	// flush_i drops only this local prefetch state; hold_i only blocks new source pops.
@@ -86,7 +82,7 @@ module ft601_tx_adapter #(
 			end
 		end
 
-		if (s_fire_pending_ff) begin
+		if (s_fire_w) begin
 			if (!word_valid_next) begin
 				data_next = s_data_i;
 				keep_next = s_keep_i;
@@ -108,7 +104,6 @@ module ft601_tx_adapter #(
 			lookahead_keep_ff <= {BE_LEN{1'b0}};
 			word_valid_ff <= 1'b0;
 			lookahead_valid_ff <= 1'b0;
-			s_fire_pending_ff <= 1'b0;
 			prefetch_en_ff <= 1'b0;
 			source_ready_ff <= 1'b0;
 		end
@@ -119,7 +114,6 @@ module ft601_tx_adapter #(
 			lookahead_keep_ff <= {BE_LEN{1'b0}};
 			word_valid_ff <= 1'b0;
 			lookahead_valid_ff <= 1'b0;
-			s_fire_pending_ff <= 1'b0;
 			prefetch_en_ff <= 1'b0;
 			source_ready_ff <= 1'b0;
 		end
@@ -130,7 +124,6 @@ module ft601_tx_adapter #(
 			lookahead_keep_ff <= lookahead_keep_next;
 			word_valid_ff <= word_valid_next;
 			lookahead_valid_ff <= lookahead_valid_next;
-			s_fire_pending_ff <= s_fire_w;
 			prefetch_en_ff <= prefetch_en_i;
 			source_ready_ff <= source_ready_w;
 		end
@@ -154,12 +147,12 @@ module ft601_tx_adapter #(
 		end
 	end
 
-	assign s_ready_o = s_fire_w;
+	assign s_ready_o = !hold_i && prefetch_en_ff && source_ready_ff && buffer_ready_w;
 	assign word_valid_o = word_valid_ff;
-	assign idle_o = !word_valid_ff && !lookahead_valid_ff && !s_fire_pending_ff;
+	assign idle_o = !word_valid_ff && !lookahead_valid_ff;
 	assign bus_data_o = data_ff;
 	assign bus_keep_o = keep_ff;
-	assign wr_n_o = !write_fire_i;
+	assign wr_n_o = !write_fire_w;
 	assign bus_drive_o = bus_drive_ff;
 
 endmodule

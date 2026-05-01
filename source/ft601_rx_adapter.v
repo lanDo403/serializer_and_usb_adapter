@@ -23,6 +23,7 @@ module ft601_rx_adapter #(
 	reg [DATA_LEN-1:0] m_data_ff;
 	reg [BE_LEN-1:0]   m_keep_ff;
 	reg                m_valid_ff;
+	reg                read_fire_ff;
 
 	wire read_fire_w;
 
@@ -35,19 +36,21 @@ module ft601_rx_adapter #(
 			m_data_ff <= {DATA_LEN{1'b0}};
 			m_keep_ff <= {BE_LEN{1'b0}};
 			m_valid_ff <= 1'b0;
+			read_fire_ff <= 1'b0;
 		end
 		else if (clear_i) begin
 			m_data_ff <= {DATA_LEN{1'b0}};
 			m_keep_ff <= {BE_LEN{1'b0}};
 			m_valid_ff <= 1'b0;
+			read_fire_ff <= 1'b0;
 		end
 		else begin
-			m_valid_ff <= 1'b0;
-			if (read_fire_w) begin
+			m_valid_ff <= read_fire_ff;
+			if (read_fire_ff) begin
 				m_data_ff <= bus_data_i;
 				m_keep_ff <= bus_keep_i;
-				m_valid_ff <= 1'b1;
 			end
+			read_fire_ff <= read_fire_w;
 		end
 	end
 

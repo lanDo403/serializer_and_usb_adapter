@@ -2,6 +2,7 @@
 
 #include "ft601_device.h"
 #include "service_protocol.h"
+#include "throughput.h"
 
 #include <iomanip>
 #include <iostream>
@@ -88,7 +89,16 @@ bool DoWriteTestPayload(FT_HANDLE h, std::string& err, FT_STATUS* last_status) {
         payload[i] = i + 1;
     }
 
-    return WriteWords(h, payload, err, last_status);
+    const ThroughputTimePoint start = ThroughputNow();
+    if (!WriteWords(h, payload, err, last_status)) {
+        return false;
+    }
+
+    const double seconds = ThroughputSeconds(start, ThroughputNow());
+    const uint64_t bytes = static_cast<uint64_t>(payload.size()) *
+                           sizeof(uint32_t);
+    PrintThroughput("Write payload throughput", bytes, seconds);
+    return true;
 }
 
 bool DoLoopbackIntegrityTest(FT_HANDLE h,
@@ -113,22 +123,38 @@ bool DoLoopbackIntegrityTest(FT_HANDLE h,
 
     std::cout << "Generating " << word_count << " payload words...\n";
     const std::vector<uint32_t> tx = GenerateDeterministicPayload(word_count);
+    const uint64_t payload_bytes = static_cast<uint64_t>(tx.size()) *
+                                   sizeof(uint32_t);
 
     std::cout << "Writing payload to EP02...\n";
+    const ThroughputTimePoint total_start = ThroughputNow();
+    const ThroughputTimePoint write_start = total_start;
     if (!WritePayload(h, tx, err, last_status)) {
         return false;
     }
+    const ThroughputTimePoint write_end = ThroughputNow();
 
     std::cout << "Reading exact loopback payload from EP82...\n";
     std::vector<uint32_t> rx;
+    const ThroughputTimePoint read_start = ThroughputNow();
     if (!ReadExactWords(h, tx.size(), rx, err, last_status)) {
         return false;
     }
+    const ThroughputTimePoint read_end = ThroughputNow();
 
     if (!ComparePayload(tx, rx, err)) {
         return false;
     }
 
+    PrintThroughput("Loopback write throughput",
+                    payload_bytes,
+                    ThroughputSeconds(write_start, write_end));
+    PrintThroughput("Loopback read throughput",
+                    payload_bytes,
+                    ThroughputSeconds(read_start, read_end));
+    PrintThroughput("Loopback round-trip throughput",
+                    payload_bytes * 2u,
+                    ThroughputSeconds(total_start, read_end));
     std::cout << "LOOPBACK PASS: " << tx.size() << " words verified.\n";
     return true;
 }

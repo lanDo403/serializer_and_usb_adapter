@@ -1,7 +1,8 @@
 `timescale 1ns / 1ps
 
 module status_source #(
-	parameter DATA_LEN = 32
+	parameter DATA_LEN = 32,
+	parameter BE_LEN   = 4
 )(
 	input                    clk,
 	input                    rst_n,
@@ -19,8 +20,9 @@ module status_source #(
 	input                    loopback_fifo_empty_i,
 	input                    loopback_fifo_full_i,
 	output                   m_active_o,
-	output                   m_empty_o,
-	output [DATA_LEN-1:0]    m_data_o
+	output                   m_valid_o,
+	output [DATA_LEN-1:0]    m_data_o,
+	output [BE_LEN-1:0]      m_keep_o
 );
 	localparam STATUS_BITS_LEN = 7;
 	localparam [DATA_LEN-1:0] STATUS_MAGIC = 32'h5AA55AA5;
@@ -29,16 +31,15 @@ module status_source #(
 	reg active_ff;
 	reg tx_started_ff;
 	reg word_is_header_ff;
-	reg advance_word_ff;
 	reg [1:0] pending_words_ff;
 	reg [STATUS_BITS_LEN-1:0] status_bits_ff;
 
-	wire source_sel;
+	wire frame_valid_w;
 	wire [DATA_LEN-1:0] status_word_mux;
 	wire issue_now_w;
 	wire activate_now_w;
 
-	assign source_sel = active_ff;
+	assign frame_valid_w = active_ff && (pending_words_ff != 2'd0);
 	assign status_word_mux = word_is_header_ff ? STATUS_MAGIC :
 	                         {{(DATA_LEN-STATUS_BITS_LEN){1'b0}}, status_bits_ff};
 	assign issue_now_w = req_i && !queued_ff && !active_ff && issue_ready_i && !hold_i;
@@ -79,32 +80,26 @@ module status_source #(
 			active_ff <= 1'b0;
 			tx_started_ff <= 1'b0;
 			word_is_header_ff <= 1'b0;
-			advance_word_ff <= 1'b0;
 			pending_words_ff <= 2'b00;
 		end
 		else if (clear_i) begin
 			active_ff <= 1'b0;
 			tx_started_ff <= 1'b0;
 			word_is_header_ff <= 1'b0;
-			advance_word_ff <= 1'b0;
 			pending_words_ff <= 2'b00;
 		end
 		else begin
-			if (advance_word_ff && word_is_header_ff)
-				word_is_header_ff <= 1'b0;
-			advance_word_ff <= 1'b0;
-
 			if (activate_now_w) begin
 				active_ff <= 1'b1;
 				word_is_header_ff <= 1'b1;
-				advance_word_ff <= 1'b0;
 				pending_words_ff <= 2'd2;
 				tx_started_ff <= 1'b0;
 			end
 
-			if (active_ff && m_ready_i && (pending_words_ff != 2'd0)) begin
+			if (frame_valid_w && m_ready_i) begin
 				pending_words_ff <= pending_words_ff - 1'b1;
-				advance_word_ff <= 1'b1;
+				if (word_is_header_ff)
+					word_is_header_ff <= 1'b0;
 			end
 
 			if (active_ff && (send_fire_i || !issue_ready_i))
@@ -114,14 +109,14 @@ module status_source #(
 				active_ff <= 1'b0;
 				tx_started_ff <= 1'b0;
 				word_is_header_ff <= 1'b0;
-				advance_word_ff <= 1'b0;
 				pending_words_ff <= 2'b00;
 			end
 		end
 	end
 
-	assign m_active_o = source_sel;
-	assign m_empty_o = (pending_words_ff == 2'd0);
+	assign m_active_o = active_ff;
+	assign m_valid_o = frame_valid_w;
 	assign m_data_o = status_word_mux;
+	assign m_keep_o = {BE_LEN{1'b1}};
 
 endmodule

@@ -11,15 +11,15 @@
 В `normal mode` полезные данные идут по цепочке:
 
 ```text
-GPIO -> gpio_wrapper -> packer8to32 -> async_fifo -> axis_tx_arbiter -> ft601_tx_adapter -> ft601_wrapper -> FT601 -> PC
+GPIO -> gpio_wrapper -> packer8to32 -> async_fifo -> sync_fifo_axis_source -> axis_tx_arbiter -> ft601_tx_adapter -> ft601_wrapper -> FT601 -> PC
 ```
 
-GPIO-домен и FT601-домен разделены асинхронным FIFO. Это штатный режим для будущего захвата данных: GPIO остается источником, FT601 RX path используется только для служебных команд.
+GPIO-домен и FT601-домен разделены асинхронным FIFO. На стороне чтения FIFO стоит небольшая stream-обертка, чтобы TX arbiter видел стабильный `valid/ready/data` поток, а не raw FIFO-сигналы. Это штатный режим для будущего захвата данных: GPIO остается источником, FT601 RX path используется только для служебных команд.
 
 В `loopback mode` источник данных меняется:
 
 ```text
-PC -> FT601 -> ft601_rx_adapter -> rx_stream_router -> loopback_fifo -> axis_tx_arbiter -> ft601_tx_adapter -> FT601 -> PC
+PC -> FT601 -> ft601_rx_adapter -> rx_stream_router -> loopback_fifo -> sync_fifo_axis_source -> axis_tx_arbiter -> ft601_tx_adapter -> FT601 -> PC
 ```
 
 Loopback FIFO хранит не только `DATA[31:0]`, но и `BE[3:0]`, поэтому payload возвращается с тем же byte-enable mask. Service frame при этом не попадает в payload.
@@ -44,7 +44,7 @@ STATUS_MAGIC = 0x5AA55AA5
 status_word
 ```
 
-Для service/status слов ожидается полный beat, то есть `BE = 4'hF`. `BE` больше не является признаком команды.
+Для service/status слов ожидается полный beat, то есть `BE = 4'hF`.
 
 Поддерживаемые команды:
 
@@ -56,7 +56,9 @@ status_word
 | `CMD_SET_LOOPBACK` | `0xA5A50004` | перейти в loopback mode |
 | `CMD_SET_NORMAL` | `0xA5A50005` | вернуться в normal mode |
 | `CMD_GET_STATUS` | `0xA5A50006` | прочитать status frame |
-| `CMD_RESET_FT_STATE` | `0xA5A50007` | очистить локальное FT-domain state без очистки normal TX FIFO |
+| `CMD_RESET_FT_STATE` | `0xA5A50007` | RTL-команда локальной очистки FT-domain state без очистки normal TX FIFO |
+
+В текущем `ft601_test` отдельного пункта меню для `CMD_RESET_FT_STATE` нет. Пользовательский сценарий использует status, mode switch и `CMD_CLR_*`; reset FT601 остается привязан к физическому `FPGA_RESET`.
 
 `status_word` пока компактный. В нем есть только текущий режим, агрегированные ошибки и empty/full флаги двух FIFO:
 
@@ -79,11 +81,11 @@ status_word
 
 ## Структура репозитория
 
-`source/` содержит RTL, testbench и constraints. Главная точка входа - `source/top.v`. Физическая граница FT601 находится в `ft601_wrapper.v`, а read/write handshake разбит между `ft601_fsm.v`, `ft601_rx_adapter.v` и `ft601_tx_adapter.v`. Выбор TX-источника делает `axis_tx_arbiter.v`, RX service/payload path разделяет `rx_stream_router.v`, а команды разбирает `service_cmd_decoder.v`.
+`source/` содержит RTL, testbench и constraints. Главная точка входа - `source/top.v`. Физическая граница FT601 находится в `ft601_wrapper.v`, а read/write handshake разбит между `ft601_fsm.v`, `ft601_rx_adapter.v` и `ft601_tx_adapter.v`. Выбор TX-источника делает `axis_tx_arbiter.v`, RX service/payload path разделяет `rx_stream_router.v`, команды разбирает `service_cmd_decoder.v`, а read-side FIFO-порты приводятся к stream-контракту через `sync_fifo_axis_source.v`.
 
 `SPECIFICATION.md` содержит актуальное техническое описание протокола, reset-системы, FT601 handshake, datapath и проверок.
 
-`ft601_test/` - консольная C++ утилита для ручной проверки с ПК через D3XX API. Код разделен по смыслу: `main.cpp` содержит меню, `ft601_device.*` работает с D3XX и pipe, `service_protocol.*` отправляет команды и читает статус, `payload_test.*` генерирует payload и делает loopback compare.
+`ft601_test/` - консольная C++ утилита для ручной проверки с ПК через D3XX API. Код разделен по смыслу: `main.cpp` содержит меню, `ft601_device.*` работает с D3XX и pipe, `service_protocol.*` отправляет команды и читает статус, `payload_test.*` генерирует payload и делает loopback compare, `throughput.*` печатает прикладную скорость payload-операций.
 
 ## Проверка RTL
 
@@ -105,7 +107,7 @@ verilator_bin.exe --lint-only --timing testbench.v
 
 Минимальный ручной сценарий на железе такой. Сначала прошить FPGA и убедиться, что FT601 настроен в `245 synchronous FIFO mode`. Затем запустить `ft601_test`, прочитать `Get FPGA status`, включить `Set loopback mode` и выполнить `Loopback integrity test`. После этого можно вернуться через `Set normal mode` и при необходимости очистить ошибки командами `Clear TX error`, `Clear RX error` или `Clear all errors`.
 
-Raw-операции `Write test payload` и `Read payload to file` остаются как debug-инструменты. Они не используются для чтения status frame.
+Raw-операции `Write test payload` и `Read payload to file` остаются как debug-инструменты. Они не используются для чтения status frame и дополнительно показывают прикладную скорость передачи.
 
 ## Куда смотреть дальше
 

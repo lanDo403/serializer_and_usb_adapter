@@ -80,16 +80,19 @@ module top #(
 	wire loop_fifo_full;
 	wire loop_fifo_empty;
 	wire loop_fifo_wen;
+	wire loop_fifo_ren;
 
 	// RX stream router
 	wire ft_rx_axis_tvalid;
 	wire ft_rx_axis_tready;
 	wire [DATA_LEN-1:0] ft_rx_axis_tdata;
 	wire [BE_LEN-1:0] ft_rx_axis_tkeep;
-	wire [FIFO_RX_LEN-1:0] ft_rx_word_raw;
-	wire ft_rx_word_valid;
-	wire [FIFO_RX_LEN-1:0] ft_rx_word;
-	wire fifo_append;
+	wire rx_cmd_valid;
+	wire [DATA_LEN-1:0] rx_cmd_opcode;
+	wire loopback_payload_tvalid;
+	wire loopback_payload_tready;
+	wire [DATA_LEN-1:0] loopback_payload_tdata;
+	wire [BE_LEN-1:0] loopback_payload_tkeep;
 	wire tx_prefetch_en;
 	wire tx_source_change;
 
@@ -113,9 +116,7 @@ module top #(
 
 	// Status source
 	wire status_source_sel;
-	wire status_source_empty;
 	wire status_issue_window;
-	wire [DATA_LEN-1:0] status_word;
 
 	// Local stream contracts between payload/status sources, the TX arbiter and
 	// FT601 adapters. This is a small valid/ready layer, not a full AXI fabric.
@@ -127,6 +128,7 @@ module top #(
 	wire loopback_axis_tready;
 	wire [DATA_LEN-1:0] loopback_axis_tdata;
 	wire [BE_LEN-1:0] loopback_axis_tkeep;
+	wire [FIFO_RX_LEN-1:0] loopback_axis_word;
 	wire status_axis_tvalid;
 	wire status_axis_tready;
 	wire [DATA_LEN-1:0] status_axis_tdata;
@@ -135,38 +137,21 @@ module top #(
 	wire tx_axis_tready;
 	wire [DATA_LEN-1:0] tx_axis_tdata;
 	wire [BE_LEN-1:0] tx_axis_tkeep;
-	wire rx_axis_tvalid;
-	wire rx_axis_tready;
-	wire [DATA_LEN-1:0] rx_axis_tdata;
-	wire [BE_LEN-1:0] rx_axis_tkeep;
 
 	// Assignings
 	assign normal_fifo_wdata = packer_data_o;
 
-	assign normal_axis_tvalid = !normal_fifo_empty;
-	assign normal_axis_tdata  = normal_fifo_rdata;
 	assign normal_axis_tkeep  = FULL_BE;
 
-	assign loopback_axis_tvalid = !loop_fifo_empty;
-	assign loopback_axis_tdata  = loop_fifo_rdata[DATA_LEN-1:0];
-	assign loopback_axis_tkeep  = loop_fifo_rdata[FIFO_RX_LEN-1:DATA_LEN];
+	assign loopback_axis_tdata  = loopback_axis_word[DATA_LEN-1:0];
+	assign loopback_axis_tkeep  = loopback_axis_word[FIFO_RX_LEN-1:DATA_LEN];
 
-	assign status_axis_tvalid = status_source_sel && !status_source_empty;
-	assign status_axis_tdata  = status_word;
-	assign status_axis_tkeep  = FULL_BE;
-
-	assign rx_axis_tvalid = ft_rx_word_valid;
-	assign rx_axis_tready = 1'b1;
-	assign rx_axis_tdata  = ft_rx_word[DATA_LEN-1:0];
-	assign rx_axis_tkeep  = ft_rx_word[FIFO_RX_LEN-1:DATA_LEN];
-
-	assign normal_fifo_ren       = normal_axis_tready;
 	assign tx_fifo_rd_underflow_event = normal_fifo_ren && normal_fifo_empty;
-	assign loopback_wr_overflow_event = loop_fifo_wen && loop_fifo_full;
-	assign loopback_rd_underflow_event = loopback_axis_tready && loop_fifo_empty;
-	assign ft_rx_word_raw      = {ft_rx_axis_tkeep, ft_rx_axis_tdata};
-	assign ft_rx_axis_tready   = loopback_mode_ft ? !loop_fifo_full : 1'b1;
-	assign fifo_append         = ft_rx_axis_tvalid;
+	assign loopback_payload_tready = !loop_fifo_full;
+	assign loop_fifo_wen = loopback_payload_tvalid && loopback_payload_tready;
+	assign loop_fifo_wdata = {loopback_payload_tkeep, loopback_payload_tdata};
+	assign loopback_wr_overflow_event = loopback_payload_tvalid && !loopback_payload_tready;
+	assign loopback_rd_underflow_event = loopback_axis_tvalid && loopback_axis_tready && loop_fifo_empty;
 	assign status_issue_window = fsm_idle_o;
 	assign ft601_reset_n_i = ~fpga_reset_i;
 	assign gpio_rst_req = fpga_reset_i;
@@ -267,6 +252,36 @@ module top #(
 		.pulse_o(tx_fifo_clear_gpio)
 	);
 
+	sync_fifo_axis_source #(
+		.DATA_LEN(DATA_LEN)
+	) normal_tx_source (
+		.clk(ft_clk_i),
+		.rst_n(ft_rst_n_i),
+		.clear_i(tx_recovery_clear_req_ft || tx_prefetch_flush_req_ft),
+		.enable_i(!loopback_mode_ft && tx_prefetch_en),
+		.fifo_data_i(normal_fifo_rdata),
+		.fifo_empty_i(normal_fifo_empty),
+		.fifo_ren_o(normal_fifo_ren),
+		.m_valid_o(normal_axis_tvalid),
+		.m_ready_i(normal_axis_tready),
+		.m_data_o(normal_axis_tdata)
+	);
+
+	sync_fifo_axis_source #(
+		.DATA_LEN(FIFO_RX_LEN)
+	) loopback_tx_source (
+		.clk(ft_clk_i),
+		.rst_n(ft_rst_n_i),
+		.clear_i(rx_recovery_clear_req_ft || ft_state_clear_req_ft || tx_source_change),
+		.enable_i(loopback_mode_ft && tx_prefetch_en && !ft_txe_n_i),
+		.fifo_data_i(loop_fifo_rdata),
+		.fifo_empty_i(loop_fifo_empty),
+		.fifo_ren_o(loop_fifo_ren),
+		.m_valid_o(loopback_axis_tvalid),
+		.m_ready_i(loopback_axis_tready),
+		.m_data_o(loopback_axis_word)
+	);
+
 	// Explicit TX stream priority: status response, then loopback, then normal payload.
 	axis_tx_arbiter #(
 		.DATA_LEN(DATA_LEN),
@@ -294,8 +309,9 @@ module top #(
 
 	// Loopback control
 	rx_stream_router #(
-		.FIFO_RX_LEN(FIFO_RX_LEN),
-		.BE_LEN(BE_LEN)
+		.DATA_LEN(DATA_LEN),
+		.BE_LEN(BE_LEN),
+		.FIFO_RX_LEN(FIFO_RX_LEN)
 	) rx_stream_router (
 		.clk(ft_clk_i),
 		.rst_n(ft_rst_n_i),
@@ -303,19 +319,24 @@ module top #(
 		.hold_i(service_hold_ft),
 		.loopback_mode_i(loopback_mode_ft),
 		.rxf_n_i(ft_rxf_n_i),
-		.s_valid_i(fifo_append),
-		.s_word_i(ft_rx_word_raw),
-		.m_cmd_valid_o(ft_rx_word_valid),
-		.m_cmd_word_o(ft_rx_word),
-		.m_loopback_valid_o(loop_fifo_wen),
-		.m_loopback_word_o(loop_fifo_wdata),
+		.s_valid_i(ft_rx_axis_tvalid),
+		.s_ready_o(ft_rx_axis_tready),
+		.s_data_i(ft_rx_axis_tdata),
+		.s_keep_i(ft_rx_axis_tkeep),
+		.cmd_valid_o(rx_cmd_valid),
+		.cmd_opcode_o(rx_cmd_opcode),
+		.m_payload_valid_o(loopback_payload_tvalid),
+		.m_payload_ready_i(loopback_payload_tready),
+		.m_payload_data_o(loopback_payload_tdata),
+		.m_payload_keep_o(loopback_payload_tkeep),
 		.prefetch_en_o(tx_prefetch_en),
 		.source_flush_o(tx_source_change)
 	);
 
 	// Status response control
 	status_source #(
-		.DATA_LEN(DATA_LEN)
+		.DATA_LEN(DATA_LEN),
+		.BE_LEN(BE_LEN)
 	) status_source (
 		.clk(ft_clk_i),
 		.rst_n(ft_rst_n_i),
@@ -333,8 +354,9 @@ module top #(
 		.loopback_fifo_empty_i(loop_fifo_empty),
 		.loopback_fifo_full_i(loop_fifo_full),
 		.m_active_o(status_source_sel),
-		.m_empty_o(status_source_empty),
-		.m_data_o(status_word)
+		.m_valid_o(status_axis_tvalid),
+		.m_data_o(status_axis_tdata),
+		.m_keep_o(status_axis_tkeep)
 	);
 
 	// GPIO I/O wrapper
@@ -404,7 +426,7 @@ module top #(
 		.rst_n(ft_rst_n_i),
 		.clear_i(rx_recovery_clear_req_ft),
 		.wen_i(loop_fifo_wen),
-		.ren_i(loopback_axis_tready),
+		.ren_i(loop_fifo_ren),
 		.data_i(loop_fifo_wdata),
 		.data_o(loop_fifo_rdata),
 		.full(loop_fifo_full),
@@ -419,8 +441,8 @@ module top #(
 	) service_cmd_decoder(
 		.clk(ft_clk_i),
 		.rst_n(ft_rst_n_i),
-		.s_valid_i(rx_axis_tvalid && rx_axis_tready),
-		.s_word_i({rx_axis_tkeep, rx_axis_tdata}),
+		.cmd_valid_i(rx_cmd_valid),
+		.cmd_opcode_i(rx_cmd_opcode),
 		.idle_i(fsm_idle_o),
 		.normal_rd_underflow_i(tx_fifo_rd_underflow_event),
 		.normal_wr_error_i(tx_fifo_error_wr_ft),

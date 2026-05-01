@@ -1,5 +1,7 @@
 #include "ft601_device.h"
 
+#include "throughput.h"
+
 #include <algorithm>
 #include <cstring>
 #include <fstream>
@@ -405,9 +407,13 @@ bool DoReadToFile(FT_HANDLE h,
 
     std::vector<uint8_t> buffer(CHUNK_BYTES);
     uint64_t total = 0;
+    bool got_payload = false;
+    ThroughputTimePoint active_start = ThroughputNow();
+    ThroughputTimePoint active_end = active_start;
 
     while (true) {
         ULONG got = 0;
+        const ThroughputTimePoint read_start = ThroughputNow();
         FT_STATUS st = FT_ReadPipe(
             h,
             IN_PIPE,
@@ -415,6 +421,7 @@ bool DoReadToFile(FT_HANDLE h,
             static_cast<ULONG>(buffer.size()),
             &got,
             nullptr);
+        const ThroughputTimePoint read_end = ThroughputNow();
 
         if (st == FT_TIMEOUT) {
             break;
@@ -445,10 +452,22 @@ bool DoReadToFile(FT_HANDLE h,
         }
 
         total += got;
+        if (!got_payload) {
+            active_start = read_start;
+            got_payload = true;
+        }
+        active_end = read_end;
         std::cout << "\rReceived: " << total << " bytes" << std::flush;
     }
 
     std::cout << "\n";
     out_bytes = total;
+    if (got_payload) {
+        PrintThroughput("Raw read throughput",
+                        total,
+                        ThroughputSeconds(active_start, active_end));
+    } else {
+        PrintThroughput("Raw read throughput", 0, 0.0);
+    }
     return true;
 }
