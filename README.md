@@ -92,10 +92,9 @@ status_word
 Базовая проверка выполняется из `source/`:
 
 ```powershell
-cd C:\Users\userIvan\Desktop\my_projects\logic_analyzer\source
+cd .\source
 iverilog -g2005-sv -o testbench.out testbench.v
 vvp .\testbench.out
-$env:VERILATOR_ROOT='C:\msys64\mingw64\share\verilator'
 verilator_bin.exe --lint-only --timing testbench.v
 ```
 
